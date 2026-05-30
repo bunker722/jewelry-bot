@@ -10,6 +10,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from supabase import create_client
 from datetime import date
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
+import io
 
 load_dotenv()
 
@@ -148,7 +151,8 @@ def main_keyboard():
     kb.button(text="📤 Ювелиру", callback_data="action_transfer")
     kb.button(text="📋 Склад", callback_data="action_inventory")
     kb.button(text="💵 Итого", callback_data="action_total")
-    kb.adjust(2, 2, 1)
+    kb.button(text="📊 Экспорт", callback_data="action_export")
+    kb.adjust(2, 2, 2)
     return kb.as_markup()
 
 
@@ -434,6 +438,91 @@ async def show_total(callback: CallbackQuery):
         f"📊 *Стоимость склада*\n\nКамней: {count}\nКаратов: {total_carat:.2f}\n"
         f"Итого: *{total_cny:,.0f} CNY*",
         reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
+# ============================================================
+# ЭКСПОРТ
+# ============================================================
+
+@dp.callback_query(F.data == "action_export")
+async def export_stones(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.edit_text("⏳ Формирую файл...")
+
+    stones = supabase.table("stones") \
+        .select("stone_code,stone_type,shape,carat,color,clarity,status,"
+                "purchase_price,purchase_currency,purchase_price_cny,purchase_date") \
+        .order("purchase_date", desc=True).execute().data or []
+
+    values_map = {}
+    view_data = supabase.table("v_stone_current_value") \
+        .select("stone_code,current_value_cny").execute().data or []
+    for row in view_data:
+        values_map[row["stone_code"]] = row["current_value_cny"]
+
+    origin_map = {"Природный": "прир.", "Синтетический": "синт."}
+    status_map = {"in_stock": "В наличии", "at_partner": "У партнёра",
+                  "reserved": "В резерве", "sent_to_client": "У клиента",
+                  "in_jewelry": "В изделии", "sold": "Продан", "written_off": "Списан"}
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Камни"
+
+    headers = ["Код", "Тип", "Происхождение", "Форма", "Вес (кар)",
+               "Цвет", "Чистота", "Статус", "Закупочная цена",
+               "Валюта", "Стоимость CNY", "Дата покупки"]
+
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    header_font = Font(bold=True, color="FFFFFF")
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+
+    col_widths = [14, 12, 14, 14, 10, 8, 10, 14, 16, 8, 14, 14]
+    for i, w in enumerate(col_widths, 1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
+
+    for r, s in enumerate(stones, 2):
+        full_type = s.get("stone_type", "")
+        if "(" in full_type:
+            type_name, rest = full_type.split("(", 1)
+            origin = origin_map.get(rest.strip(" )"), rest.strip(" )"))
+        else:
+            type_name, origin = full_type, ""
+
+        ws.append([
+            s.get("stone_code", ""),
+            type_name.strip(),
+            origin,
+            s.get("shape", ""),
+            s.get("carat"),
+            s.get("color", ""),
+            s.get("clarity", ""),
+            status_map.get(s.get("status", ""), s.get("status", "")),
+            s.get("purchase_price"),
+            s.get("purchase_currency", ""),
+            values_map.get(s.get("stone_code"), s.get("purchase_price_cny")),
+            s.get("purchase_date", ""),
+        ])
+        if r % 2 == 0:
+            for col in range(1, len(headers) + 1):
+                ws.cell(row=r, column=col).fill = PatternFill("solid", fgColor="D6E4F0")
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    from aiogram.types import BufferedInputFile
+    filename = f"stones_{date.today().strftime('%Y%m%d')}.xlsx"
+    kb = InlineKeyboardBuilder()
+    kb.button(text="◀️ Меню", callback_data="back_menu")
+    await callback.message.answer_document(
+        BufferedInputFile(buf.read(), filename=filename),
+        caption=f"📊 Экспорт: {len(stones)} камней · {date.today()}")
+    await callback.message.edit_text("✅ Файл отправлен.", reply_markup=kb.as_markup())
 
 
 # ============================================================
