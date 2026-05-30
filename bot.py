@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
@@ -6,7 +7,7 @@ from aiogram.types import Message, CallbackQuery, TelegramObject
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.base import BaseStorage, StorageKey
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from supabase import create_client
 from datetime import date
@@ -21,10 +22,60 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SECRET")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
+class SupabaseFSMStorage(BaseStorage):
+    """FSM storage backed by Supabase — переживает редеплои Railway."""
+
+    def __init__(self, sb):
+        self._db = sb
+
+    def _key(self, key: StorageKey) -> str:
+        return f"{key.bot_id}:{key.chat_id}:{key.user_id}:{key.destiny}"
+
+    async def _upsert(self, key: StorageKey, fields: dict) -> None:
+        k = self._key(key)
+        await asyncio.to_thread(
+            lambda: self._db.table("fsm_storage")
+                .upsert({"key": k, **fields}, on_conflict="key")
+                .execute()
+        )
+
+    async def _fetch(self, key: StorageKey) -> dict:
+        k = self._key(key)
+        res = await asyncio.to_thread(
+            lambda: self._db.table("fsm_storage")
+                .select("state,data")
+                .eq("key", k)
+                .execute()
+        )
+        return res.data[0] if res.data else {}
+
+    async def set_state(self, key: StorageKey, state=None) -> None:
+        state_str = state.state if hasattr(state, "state") else state
+        await self._upsert(key, {"state": state_str})
+
+    async def get_state(self, key: StorageKey):
+        return (await self._fetch(key)).get("state")
+
+    async def set_data(self, key: StorageKey, data: dict) -> None:
+        await self._upsert(key, {"data": json.dumps(data, ensure_ascii=False)})
+
+    async def get_data(self, key: StorageKey) -> dict:
+        raw = (await self._fetch(key)).get("data")
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {}
+
+    async def close(self) -> None:
+        pass
+
+
 bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+storage = SupabaseFSMStorage(supabase)
+dp = Dispatcher(storage=storage)
 
 
 # ============================================================
