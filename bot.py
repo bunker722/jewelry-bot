@@ -86,7 +86,9 @@ class AccessMiddleware(BaseMiddleware):
     async def __call__(self, handler, event: TelegramObject, data: dict):
         user = data.get("event_from_user")
         if user:
-            res = supabase.table("users").select("id").eq("telegram_id", user.id).execute()
+            res = await asyncio.to_thread(
+                lambda: supabase.table("users").select("id").eq("telegram_id", user.id).execute()
+            )
             if not res.data:
                 if isinstance(event, Message):
                     await event.answer("⛔️ У вас нет доступа. Обратитесь к администратору.")
@@ -1051,6 +1053,19 @@ async def _insert_stone(callback: CallbackQuery, state: FSMContext, data: dict):
         }).execute()
 
         stone_id = res.data[0]["id"]
+
+        supabase.table("operations").insert({
+            "operation_type": "purchase_stone",
+            "entity_type": "stone",
+            "entity_id": stone_id,
+            "counterparty_id": data.get("supplier_id"),
+            "amount": price,
+            "currency": currency,
+            "amount_usd": price_usd,
+            "exchange_rate": rate,
+            "created_by": user_id,
+        }).execute()
+
         await state.update_data(inserted_stone_id=stone_id, inserted_stone_code=stone_code,
                                 inserted_price_usd=price_usd)
         await state.set_state(BuyStone.photo)
