@@ -86,9 +86,7 @@ class AccessMiddleware(BaseMiddleware):
     async def __call__(self, handler, event: TelegramObject, data: dict):
         user = data.get("event_from_user")
         if user:
-            res = await asyncio.to_thread(
-                lambda: supabase.table("users").select("id").eq("telegram_id", user.id).execute()
-            )
+            res = supabase.table("users").select("id").eq("telegram_id", user.id).execute()
             if not res.data:
                 if isinstance(event, Message):
                     await event.answer("⛔️ У вас нет доступа. Обратитесь к администратору.")
