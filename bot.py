@@ -105,6 +105,7 @@ dp.callback_query.middleware(AccessMiddleware())
 
 class BuyStone(StatesGroup):
     stone_type = State()
+    stone_type_custom = State()
     origin = State()
     shape = State()
     shape_custom = State()
@@ -599,8 +600,9 @@ async def buy_step1_type(callback: CallbackQuery, state: FSMContext):
     kb.button(text="💚 Изумруд", callback_data="type_emerald")
     kb.button(text="🔴 Рубин", callback_data="type_ruby")
     kb.button(text="🩷 Шпинель", callback_data="type_spinel")
+    kb.button(text="✏️ Другой камень", callback_data="type_custom")
     kb.button(text="◀️ Назад", callback_data="back_menu")
-    kb.adjust(2, 2, 1)
+    kb.adjust(2, 2, 1, 1)
     await state.set_state(BuyStone.stone_type)
     await callback.message.edit_text("💎 *Тип камня?*",
                                      reply_markup=kb.as_markup(), parse_mode="Markdown")
@@ -633,6 +635,26 @@ async def buy_step2_origin(callback: CallbackQuery, state: FSMContext):
 # ============================================================
 # КУПИЛИ — шаг 3: форма
 # ============================================================
+
+@dp.callback_query(BuyStone.stone_type, F.data == "type_custom")
+async def buy_step1_type_custom(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(BuyStone.stone_type_custom)
+    await callback.message.edit_text("✏️ Введи название камня:")
+
+
+@dp.message(BuyStone.stone_type_custom)
+async def buy_step1_type_custom_text(message: Message, state: FSMContext):
+    stone_type = message.text.strip()
+    await state.update_data(stone_type=stone_type)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🌍 Природный", callback_data="origin_natural")
+    kb.button(text="🔬 Синтетический", callback_data="origin_synthetic")
+    kb.button(text="◀️ Назад", callback_data="action_buy")
+    kb.adjust(2, 1)
+    await state.set_state(BuyStone.origin)
+    await message.answer(f"*{stone_type}*\n\n🌍 Происхождение?",
+                         reply_markup=kb.as_markup(), parse_mode="Markdown")
+
 
 @dp.callback_query(BuyStone.origin, F.data.startswith("origin_"))
 async def buy_step3_shape(callback: CallbackQuery, state: FSMContext):
