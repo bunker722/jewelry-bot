@@ -190,6 +190,27 @@ async def cmd_adduser(message: Message):
         await message.answer(f"❌ Ошибка: {e}")
 
 
+@dp.message(Command("listusers"))
+async def cmd_listusers(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Нет доступа.")
+        return
+
+    res = supabase.table("users").select("telegram_id,name,role,is_active").order("created_at").execute()
+    if not res.data:
+        await message.answer("Список пользователей пуст.")
+        return
+
+    role_emoji = {"owner": "👑", "manager": "👤", "viewer": "👁"}
+    lines = ["👥 *Пользователи:*\n"]
+    for u in res.data:
+        emoji = role_emoji.get(u["role"], "👤")
+        active = "✅" if u["is_active"] else "🚫"
+        lines.append(f"{active} {emoji} *{u['name']}*\n   ID: `{u['telegram_id']}` · {u['role']}")
+
+    await message.answer("\n\n".join(lines), parse_mode="Markdown")
+
+
 @dp.message(Command("deluser"))
 async def cmd_deluser(message: Message):
     if message.from_user.id != ADMIN_ID:
