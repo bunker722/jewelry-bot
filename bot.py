@@ -190,6 +190,43 @@ async def cmd_adduser(message: Message):
         await message.answer(f"❌ Ошибка: {e}")
 
 
+@dp.message(Command("deluser"))
+async def cmd_deluser(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Нет доступа.")
+        return
+
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer(
+            "Использование: /deluser <telegram_id>\n\n"
+            "Пример: /deluser 123456789")
+        return
+
+    try:
+        tg_id = int(args[1])
+    except ValueError:
+        await message.answer("❌ telegram_id должен быть числом.")
+        return
+
+    if tg_id == ADMIN_ID:
+        await message.answer("❌ Нельзя удалить самого себя.")
+        return
+
+    existing = supabase.table("users").select("id,name,role").eq("telegram_id", tg_id).execute()
+    if not existing.data:
+        await message.answer(f"⚠️ Пользователь с ID {tg_id} не найден.")
+        return
+
+    user = existing.data[0]
+    try:
+        supabase.table("users").delete().eq("telegram_id", tg_id).execute()
+        await message.answer(
+            f"✅ Пользователь удалён:\nID: {tg_id}\nИмя: {user['name']}\nРоль: {user['role']}")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
     await state.clear()
