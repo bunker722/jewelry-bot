@@ -612,7 +612,7 @@ async def buy_step1_type(callback: CallbackQuery, state: FSMContext):
 # КУПИЛИ — шаг 2: происхождение
 # ============================================================
 
-@dp.callback_query(BuyStone.stone_type, F.data.startswith("type_"))
+@dp.callback_query(BuyStone.stone_type, F.data.startswith("type_"), F.data != "type_custom")
 async def buy_step2_origin(callback: CallbackQuery, state: FSMContext):
     type_map = {"type_diamond": "diamond", "type_emerald": "emerald",
                 "type_ruby": "ruby", "type_spinel": "spinel"}
