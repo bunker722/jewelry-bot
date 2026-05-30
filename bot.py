@@ -38,9 +38,9 @@ class AccessMiddleware(BaseMiddleware):
             res = supabase.table("users").select("id").eq("telegram_id", user.id).execute()
             if not res.data:
                 if isinstance(event, Message):
-                    await event.answer("⛔ У вас нет доступа.")
+                    await event.answer("⛔️ У вас нет доступа. Обратитесь к администратору.")
                 elif isinstance(event, CallbackQuery):
-                    await event.answer("⛔ У вас нет доступа.", show_alert=True)
+                    await event.answer("⛔️ У вас нет доступа. Обратитесь к администратору.", show_alert=True)
                 return
         return await handler(event, data)
 
