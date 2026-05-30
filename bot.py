@@ -63,6 +63,7 @@ class BuyStone(StatesGroup):
     clarity = State()
     price = State()
     currency = State()
+    exchange_rate = State()
     supplier = State()
     new_supplier = State()
     confirm = State()
@@ -74,6 +75,7 @@ class SellStone(StatesGroup):
     select_stone = State()
     price = State()
     currency = State()
+    exchange_rate = State()
     client = State()
     new_client = State()
     confirm = State()
@@ -109,6 +111,9 @@ def abbr_code(code: str) -> str:
     if len(parts) == 3 and len(parts[1]) == 4:
         parts[1] = parts[1][2:]
     return "-".join(parts)
+
+def abbr_color(c: str) -> str:
+    return c if len(c) <= 5 else c[:4] + "."
 
 def abbr_type(full_type: str) -> str:
     type_map = {"diamond": "Бри", "emerald": "Изу", "ruby": "Руб", "spinel": "Шпи"}
@@ -331,7 +336,7 @@ async def cmd_start(message: Message, state: FSMContext):
 
 def _build_history_text() -> str | None:
     res = supabase.table("operations") \
-        .select("operation_type,amount,currency,amount_cny,created_at,entity_id,counterparty_id") \
+        .select("operation_type,amount,currency,amount_usd,created_at,entity_id,counterparty_id") \
         .order("created_at", desc=True).limit(10).execute()
     if not res.data:
         return None
@@ -365,7 +370,7 @@ def _build_history_text() -> str | None:
         stone_info = (f"{abbr_type(stone['stone_type'])} {stone.get('carat','')}кар · {abbr_code(sc)}"
                       if sc else "—")
         cp_name = cp_map.get(op.get("counterparty_id"), "")
-        amount_str = f"{op['amount']:,.0f} {op['currency']} ({op['amount_cny']:,.0f} CNY)" \
+        amount_str = f"{op['amount']:,.0f} {op['currency']} ({op['amount_usd']:,.0f} USD)" \
             if op.get("amount") else ""
         date_str = op["created_at"][:10] if op.get("created_at") else ""
         line = f"{op_type} · {date_str}\n  {stone_info}"
@@ -391,7 +396,7 @@ async def show_history(callback: CallbackQuery):
 @dp.callback_query(F.data == "action_inventory")
 async def show_inventory(callback: CallbackQuery):
     data = supabase.table("v_stone_current_value") \
-        .select("stone_code,stone_type,carat,color,clarity,status,current_value_cny") \
+        .select("stone_code,stone_type,carat,color,clarity,status,current_value_usd") \
         .not_.in_("status", ["sold", "written_off"]) \
         .order("carat", desc=True).execute()
 
@@ -403,13 +408,13 @@ async def show_inventory(callback: CallbackQuery):
     for s in data.data:
         emoji = get_status_emoji(s["status"])
         status = get_status_name(s["status"])
-        color = s.get("color") or ""
+        color = abbr_color(s.get("color") or "")
         clarity = s.get("clarity") or ""
         chars = " · ".join(filter(None, [color, clarity]))
         lines.append(
             f"{emoji} *{abbr_type(s['stone_type'])}* {s['carat']}кар"
             + (f" · {chars}" if chars else "")
-            + f"\n   {status} · {abbr_code(s['stone_code'])} · {s['current_value_cny']:,.0f} CNY"
+            + f"\n   {status} · {abbr_code(s['stone_code'])} · {s['current_value_usd']:,.0f} USD"
         )
 
     kb = InlineKeyboardBuilder()
@@ -425,10 +430,10 @@ async def show_inventory(callback: CallbackQuery):
 @dp.callback_query(F.data == "action_total")
 async def show_total(callback: CallbackQuery):
     data = supabase.table("v_stone_current_value") \
-        .select("current_value_cny,carat,status") \
+        .select("current_value_usd,carat,status") \
         .not_.in_("status", ["sold", "written_off"]).execute()
 
-    total_cny = sum(s["current_value_cny"] or 0 for s in data.data)
+    total_usd = sum(s["current_value_usd"] or 0 for s in data.data)
     total_carat = sum(s["carat"] or 0 for s in data.data)
     count = len(data.data)
 
@@ -436,7 +441,7 @@ async def show_total(callback: CallbackQuery):
     kb.button(text="◀️ Меню", callback_data="back_menu")
     await callback.message.edit_text(
         f"📊 *Стоимость склада*\n\nКамней: {count}\nКаратов: {total_carat:.2f}\n"
-        f"Итого: *{total_cny:,.0f} CNY*",
+        f"Итого: *{total_usd:,.0f} USD*",
         reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 
@@ -449,18 +454,11 @@ async def export_stones(callback: CallbackQuery):
     await callback.answer()
     await callback.message.edit_text("⏳ Формирую файл...")
 
-    stones = supabase.table("stones") \
+    stones = supabase.table("v_stone_current_value") \
         .select("stone_code,stone_type,shape,carat,color,clarity,status,"
-                "purchase_price,purchase_currency,purchase_price_cny,purchase_date") \
+                "purchase_price,purchase_currency,current_value_usd,purchase_date") \
         .order("purchase_date", desc=True).execute().data or []
 
-    values_map = {}
-    view_data = supabase.table("v_stone_current_value") \
-        .select("stone_code,current_value_cny").execute().data or []
-    for row in view_data:
-        values_map[row["stone_code"]] = row["current_value_cny"]
-
-    origin_map = {"Природный": "прир.", "Синтетический": "синт."}
     status_map = {"in_stock": "В наличии", "at_partner": "У партнёра",
                   "reserved": "В резерве", "sent_to_client": "У клиента",
                   "in_jewelry": "В изделии", "sold": "Продан", "written_off": "Списан"}
@@ -469,9 +467,8 @@ async def export_stones(callback: CallbackQuery):
     ws = wb.active
     ws.title = "Камни"
 
-    headers = ["Код", "Тип", "Происхождение", "Форма", "Вес (кар)",
-               "Цвет", "Чистота", "Статус", "Закупочная цена",
-               "Валюта", "Стоимость CNY", "Дата покупки"]
+    headers = ["Код", "Тип", "Форма", "Вес", "Цвет",
+               "Чистота", "Статус", "Цена покупки", "Валюта", "Стоимость USD", "Дата покупки"]
 
     header_fill = PatternFill("solid", fgColor="1F4E79")
     header_font = Font(bold=True, color="FFFFFF")
@@ -481,22 +478,14 @@ async def export_stones(callback: CallbackQuery):
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center")
 
-    col_widths = [14, 12, 14, 14, 10, 8, 10, 14, 16, 8, 14, 14]
+    col_widths = [14, 20, 14, 8, 8, 10, 14, 14, 8, 14, 14]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
 
     for r, s in enumerate(stones, 2):
-        full_type = s.get("stone_type", "")
-        if "(" in full_type:
-            type_name, rest = full_type.split("(", 1)
-            origin = origin_map.get(rest.strip(" )"), rest.strip(" )"))
-        else:
-            type_name, origin = full_type, ""
-
         ws.append([
             s.get("stone_code", ""),
-            type_name.strip(),
-            origin,
+            s.get("stone_type", ""),
             s.get("shape", ""),
             s.get("carat"),
             s.get("color", ""),
@@ -504,7 +493,7 @@ async def export_stones(callback: CallbackQuery):
             status_map.get(s.get("status", ""), s.get("status", "")),
             s.get("purchase_price"),
             s.get("purchase_currency", ""),
-            values_map.get(s.get("stone_code"), s.get("purchase_price_cny")),
+            s.get("current_value_usd"),
             s.get("purchase_date", ""),
         ])
         if r % 2 == 0:
@@ -613,26 +602,28 @@ async def buy_step3_shape_selected(callback: CallbackQuery, state: FSMContext):
 
 async def buy_step4_carat_cb(callback: CallbackQuery, state: FSMContext):
     kb = InlineKeyboardBuilder()
-    for c in ["0.30", "0.50", "0.70", "1.00", "1.50", "2.00", "3.00", "5.00"]:
-        kb.button(text=c, callback_data=f"carat_{c}")
+    kb.button(text="0.1–0.9 кар", callback_data="carat_hint_small")
+    kb.button(text="1–4 кар", callback_data="carat_hint_mid")
+    kb.button(text="5+ кар", callback_data="carat_hint_large")
     kb.button(text="✏️ Ввести точно", callback_data="carat_custom")
-    kb.adjust(4, 4, 1)
+    kb.adjust(3, 1)
     await state.set_state(BuyStone.carat)
     await callback.message.edit_text("⚖️ *Вес (каратов)?*",
                                      reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 async def buy_step4_carat_msg(message: Message, state: FSMContext):
     kb = InlineKeyboardBuilder()
-    for c in ["0.30", "0.50", "0.70", "1.00", "1.50", "2.00", "3.00", "5.00"]:
-        kb.button(text=c, callback_data=f"carat_{c}")
+    kb.button(text="0.1–0.9 кар", callback_data="carat_hint_small")
+    kb.button(text="1–4 кар", callback_data="carat_hint_mid")
+    kb.button(text="5+ кар", callback_data="carat_hint_large")
     kb.button(text="✏️ Ввести точно", callback_data="carat_custom")
-    kb.adjust(4, 4, 1)
+    kb.adjust(3, 1)
     await state.set_state(BuyStone.carat)
     await message.answer("⚖️ *Вес (каратов)?*",
                         reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 
-@dp.callback_query(BuyStone.carat, F.data == "carat_custom")
+@dp.callback_query(BuyStone.carat, F.data.in_({"carat_custom", "carat_hint_small", "carat_hint_mid", "carat_hint_large"}))
 async def buy_step4_carat_custom(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BuyStone.carat_custom)
     await callback.message.edit_text("✏️ Введи точный вес в каратах (например: 1.23):")
@@ -647,12 +638,6 @@ async def buy_step4_carat_text(message: Message, state: FSMContext):
     except:
         await message.answer("❌ Введи число, например: 1.23")
 
-
-@dp.callback_query(BuyStone.carat, F.data.startswith("carat_"))
-async def buy_step4_carat_selected(callback: CallbackQuery, state: FSMContext):
-    carat = float(callback.data.replace("carat_", ""))
-    await state.update_data(carat=carat)
-    await buy_step5_color_cb(callback, state)
 
 
 # ============================================================
@@ -799,25 +784,46 @@ async def buy_step7_price_entered(message: Message, state: FSMContext):
 
 
 # ============================================================
-# КУПИЛИ — шаг 8: валюта → поставщик
+# КУПИЛИ — шаг 8: валюта → курс → поставщик
 # ============================================================
 
-@dp.callback_query(BuyStone.currency, F.data.startswith("currency_"))
-async def buy_step8_supplier(callback: CallbackQuery, state: FSMContext):
-    currency = callback.data.replace("currency_", "")
-    await state.update_data(currency=currency)
-
+async def _show_buy_supplier(target, state: FSMContext):
     res = supabase.table("counterparties").select("id,name").eq("type", "supplier").execute()
     suppliers = res.data or []
-
     kb = InlineKeyboardBuilder()
     for s in suppliers:
         kb.button(text=s["name"], callback_data=f"supplier_{s['id']}")
     kb.button(text="✏️ Новый поставщик", callback_data="supplier_new")
     kb.adjust(1)
     await state.set_state(BuyStone.supplier)
-    await callback.message.edit_text("🏪 *Поставщик?*",
-                                     reply_markup=kb.as_markup(), parse_mode="Markdown")
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text("🏪 *Поставщик?*", reply_markup=kb.as_markup(), parse_mode="Markdown")
+    else:
+        await target.answer("🏪 *Поставщик?*", reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+@dp.callback_query(BuyStone.currency, F.data.startswith("currency_"))
+async def buy_step8_currency(callback: CallbackQuery, state: FSMContext):
+    currency = callback.data.replace("currency_", "")
+    await state.update_data(currency=currency)
+    if currency == "USD":
+        await state.update_data(exchange_rate=1.0)
+        await _show_buy_supplier(callback, state)
+    else:
+        await state.set_state(BuyStone.exchange_rate)
+        await callback.message.edit_text(
+            f"💱 *Курс на момент сделки:*\n1 USD = ? {currency}\n\nВведи число (например: 7.25):",
+            parse_mode="Markdown")
+
+@dp.message(BuyStone.exchange_rate)
+async def buy_step8_rate(message: Message, state: FSMContext):
+    try:
+        rate = float(message.text.strip().replace(",", "."))
+        if rate <= 0:
+            raise ValueError
+        await state.update_data(exchange_rate=rate)
+        await _show_buy_supplier(message, state)
+    except:
+        await message.answer("❌ Введи число больше нуля, например: 7.25")
 
 
 @dp.callback_query(BuyStone.supplier, F.data == "supplier_new")
@@ -847,7 +853,7 @@ async def buy_step8_supplier_new_name(message: Message, state: FSMContext):
         f"Вес: {data.get('carat', '—')} кар\n"
         f"Цвет: {data.get('color', '—')}\n"
         f"Чистота: {data.get('clarity', '—')}\n"
-        f"Цена: {data.get('price', '—'):,.0f} {data.get('currency', '—')}\n"
+        f"Цена: {_fmt_price_with_usd(data)}\n"
         f"Поставщик: {name}"
     )
     kb = InlineKeyboardBuilder()
@@ -870,6 +876,16 @@ async def buy_step8_supplier_selected(callback: CallbackQuery, state: FSMContext
 # КУПИЛИ — шаг 9: подтверждение
 # ============================================================
 
+def _fmt_price_with_usd(data: dict) -> str:
+    price = data.get("price", 0) or 0
+    currency = data.get("currency", "USD")
+    rate = data.get("exchange_rate", 1.0) or 1.0
+    price_usd = price / rate
+    s = f"{price:,.0f} {currency}"
+    if currency != "USD":
+        s += f" = {price_usd:,.0f} USD"
+    return s
+
 async def buy_confirm(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
 
@@ -883,7 +899,7 @@ async def buy_confirm(callback: CallbackQuery, state: FSMContext):
         f"Вес: {data.get('carat', '—')} кар\n"
         f"Цвет: {data.get('color', '—')}\n"
         f"Чистота: {data.get('clarity', '—')}\n"
-        f"Цена: {data.get('price', '—'):,.0f} {data.get('currency', '—')}\n"
+        f"Цена: {_fmt_price_with_usd(data)}\n"
         f"Поставщик: {data.get('supplier_name', '—')}"
     )
 
@@ -901,9 +917,9 @@ def _skip_kb():
     return kb.as_markup()
 
 
-async def _ask_photo(target, stone_code: str, price_cny: float):
+async def _ask_photo(target, stone_code: str, price_usd: float):
     text = (f"✅ *Камень внесён!*\n\nКод: `{stone_code}`\n"
-            f"Стоимость: {price_cny:,.0f} CNY\n\n"
+            f"Стоимость: {price_usd:,.0f} USD\n\n"
             f"📸 Загрузи фото камня (или нажми Пропустить)")
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(text, reply_markup=_skip_kb(), parse_mode="Markdown")
@@ -934,11 +950,10 @@ async def _insert_stone(callback: CallbackQuery, state: FSMContext, data: dict):
     user_id = get_user_id(callback.from_user.id)
     stone_code = next_stone_code()
 
-    rate_map = {"CNY": 1.0, "USD": 7.24, "THB": 0.20, "RUB": 0.078}
-    currency = data.get("currency", "CNY")
+    currency = data.get("currency", "USD")
     price = data.get("price", 0)
-    rate = rate_map.get(currency, 1.0)
-    price_cny = price * rate
+    rate = data.get("exchange_rate", 1.0) or 1.0
+    price_usd = round(price / rate, 2)
 
     origin_str = data.get("origin", "")
     stone_type = data.get("stone_type", "")
@@ -955,7 +970,7 @@ async def _insert_stone(callback: CallbackQuery, state: FSMContext, data: dict):
             "purchase_date": str(date.today()),
             "purchase_price": price,
             "purchase_currency": currency,
-            "purchase_price_cny": round(price_cny, 2),
+            "purchase_price_usd": price_usd,
             "exchange_rate": rate,
             "supplier_id": data.get("supplier_id"),
             "status": "in_stock",
@@ -964,9 +979,9 @@ async def _insert_stone(callback: CallbackQuery, state: FSMContext, data: dict):
 
         stone_id = res.data[0]["id"]
         await state.update_data(inserted_stone_id=stone_id, inserted_stone_code=stone_code,
-                                inserted_price_cny=price_cny)
+                                inserted_price_usd=price_usd)
         await state.set_state(BuyStone.photo)
-        await _ask_photo(callback, stone_code, price_cny)
+        await _ask_photo(callback, stone_code, price_usd)
     except Exception as e:
         await callback.message.edit_text(f"❌ Ошибка: {e}")
 
@@ -1128,22 +1143,43 @@ async def sell_step3_currency(message: Message, state: FSMContext):
         await message.answer("❌ Введи число")
 
 
-@dp.callback_query(SellStone.currency, F.data.startswith("sell_cur_"))
-async def sell_step4_client(callback: CallbackQuery, state: FSMContext):
-    currency = callback.data.replace("sell_cur_", "")
-    await state.update_data(currency=currency)
-
+async def _show_sell_client(target, state: FSMContext):
     res = supabase.table("counterparties").select("id,name").eq("type", "client").execute()
     clients = res.data or []
-
     kb = InlineKeyboardBuilder()
     for c in clients:
         kb.button(text=c["name"], callback_data=f"sell_client_{c['id']}")
     kb.button(text="✏️ Новый клиент", callback_data="sell_client_new")
     kb.adjust(1)
     await state.set_state(SellStone.client)
-    await callback.message.edit_text("👤 *Кому продали?*",
-                                     reply_markup=kb.as_markup(), parse_mode="Markdown")
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text("👤 *Кому продали?*", reply_markup=kb.as_markup(), parse_mode="Markdown")
+    else:
+        await target.answer("👤 *Кому продали?*", reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+@dp.callback_query(SellStone.currency, F.data.startswith("sell_cur_"))
+async def sell_step4_currency(callback: CallbackQuery, state: FSMContext):
+    currency = callback.data.replace("sell_cur_", "")
+    await state.update_data(currency=currency)
+    if currency == "USD":
+        await state.update_data(exchange_rate=1.0)
+        await _show_sell_client(callback, state)
+    else:
+        await state.set_state(SellStone.exchange_rate)
+        await callback.message.edit_text(
+            f"💱 *Курс на момент сделки:*\n1 USD = ? {currency}\n\nВведи число (например: 7.25):",
+            parse_mode="Markdown")
+
+@dp.message(SellStone.exchange_rate)
+async def sell_step4_rate(message: Message, state: FSMContext):
+    try:
+        rate = float(message.text.strip().replace(",", "."))
+        if rate <= 0:
+            raise ValueError
+        await state.update_data(exchange_rate=rate)
+        await _show_sell_client(message, state)
+    except:
+        await message.answer("❌ Введи число больше нуля, например: 7.25")
 
 
 @dp.callback_query(SellStone.client, F.data == "sell_client_new")
@@ -1170,7 +1206,7 @@ async def sell_client_new_name(message: Message, state: FSMContext):
     await state.set_state(SellStone.confirm)
     await message.answer(
         f"✅ *Продажа:*\n\nКамень: {data['stone_code']}\n"
-        f"Цена: {data['price']:,.0f} {data['currency']}\nКлиент: {name}",
+        f"Цена: {_fmt_price_with_usd(data)}\nКлиент: {name}",
         reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 
@@ -1190,7 +1226,7 @@ async def sell_confirm(callback: CallbackQuery, state: FSMContext):
     await state.set_state(SellStone.confirm)
     await callback.message.edit_text(
         f"✅ *Продажа:*\n\nКамень: {data['stone_code']}\n"
-        f"Цена: {data['price']:,.0f} {data['currency']}\nКлиент: {client_name}",
+        f"Цена: {_fmt_price_with_usd(data)}\nКлиент: {client_name}",
         reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 
@@ -1199,9 +1235,8 @@ async def sell_save(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     user_id = get_user_id(callback.from_user.id)
 
-    rate_map = {"CNY": 1.0, "USD": 7.24, "THB": 0.20, "RUB": 0.078}
-    rate = rate_map.get(data["currency"], 1.0)
-    amount_cny = data["price"] * rate
+    rate = data.get("exchange_rate", 1.0) or 1.0
+    amount_usd = round(data["price"] / rate, 2)
 
     try:
         supabase.table("stones").update({"status": "sold"}).eq("id", data["stone_id"]).execute()
@@ -1212,7 +1247,7 @@ async def sell_save(callback: CallbackQuery, state: FSMContext):
             "counterparty_id": data.get("client_id"),
             "amount": data["price"],
             "currency": data["currency"],
-            "amount_cny": round(amount_cny, 2),
+            "amount_usd": amount_usd,
             "exchange_rate": rate,
             "created_by": user_id,
         }).execute()
@@ -1222,7 +1257,7 @@ async def sell_save(callback: CallbackQuery, state: FSMContext):
         kb.button(text="◀️ Меню", callback_data="back_menu")
         await callback.message.edit_text(
             f"✅ *Продажа записана!*\n\n{data['stone_code']} продан\n"
-            f"Сумма: {amount_cny:,.0f} CNY",
+            f"Сумма: {amount_usd:,.0f} USD",
             reply_markup=kb.as_markup(), parse_mode="Markdown")
     except Exception as e:
         await callback.message.edit_text(f"❌ Ошибка: {e}")
@@ -1356,6 +1391,89 @@ async def back_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("💎 *Jewelry AI*\n\nВыбери действие:",
                                      reply_markup=main_keyboard(), parse_mode="Markdown")
+
+
+# ============================================================
+# КАРТОЧКА КАМНЯ
+# ============================================================
+
+@dp.message(Command("stone"))
+async def cmd_stone(message: Message, state: FSMContext):
+    await state.clear()
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("Использование: /stone <код>\n\nПример: /stone ST-2026-001")
+        return
+
+    code = args[1].strip().upper()
+    res = supabase.table("stones").select(
+        "id,stone_code,stone_type,shape,carat,color,clarity,status,"
+        "purchase_price,purchase_currency,purchase_price_usd,created_at,created_by,supplier_id"
+    ).ilike("stone_code", code).execute()
+
+    if not res.data:
+        await message.answer(f"❌ Камень `{code}` не найден.", parse_mode="Markdown")
+        return
+
+    s = res.data[0]
+
+    supplier_name = "—"
+    if s.get("supplier_id"):
+        sp = supabase.table("counterparties").select("name").eq("id", s["supplier_id"]).execute()
+        if sp.data:
+            supplier_name = sp.data[0]["name"]
+
+    creator_name = "—"
+    if s.get("created_by"):
+        u = supabase.table("users").select("name").eq("id", s["created_by"]).execute()
+        if u.data:
+            creator_name = u.data[0]["name"]
+    creator_date = s["created_at"][:10] if s.get("created_at") else "—"
+
+    color = abbr_color(s.get("color") or "")
+    clarity = s.get("clarity") or ""
+    color_clarity = " · ".join(filter(None, [color, clarity]))
+
+    lines = [
+        f"💎 *{abbr_type(s['stone_type'])}* {s['carat']}кар · `{abbr_code(s['stone_code'])}`",
+        f"Форма: {s.get('shape') or '—'}",
+    ]
+    if color_clarity:
+        lines.append(f"Цвет/Чистота: {color_clarity}")
+    lines += [
+        f"Статус: {get_status_emoji(s['status'])} {get_status_name(s['status'])}",
+        f"",
+        f"Поставщик: {supplier_name}",
+        f"Цена: {s.get('purchase_price', 0):,.0f} {s.get('purchase_currency', '')} "
+        f"({s.get('purchase_price_usd', 0):,.0f} USD)",
+        f"",
+        f"Внёс: {creator_name} · {creator_date}",
+    ]
+
+    if s["status"] == "sold":
+        sale = supabase.table("operations").select(
+            "created_by,created_at,counterparty_id"
+        ).eq("entity_id", s["id"]).eq("operation_type", "sale_stone") \
+         .order("created_at", desc=True).limit(1).execute()
+
+        if sale.data:
+            op = sale.data[0]
+            seller_name = "—"
+            if op.get("created_by"):
+                su = supabase.table("users").select("name").eq("id", op["created_by"]).execute()
+                if su.data:
+                    seller_name = su.data[0]["name"]
+            sale_date = op["created_at"][:10] if op.get("created_at") else "—"
+            client_name = "—"
+            if op.get("counterparty_id"):
+                cl = supabase.table("counterparties").select("name").eq("id", op["counterparty_id"]).execute()
+                if cl.data:
+                    client_name = cl.data[0]["name"]
+            lines.append(f"Продал: {seller_name} · {sale_date} → {client_name}")
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="◀️ Меню", callback_data="back_menu")
+    await message.answer("\n".join(lines), reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 
 # ============================================================
