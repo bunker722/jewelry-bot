@@ -154,7 +154,7 @@ async def cmd_adduser(message: Message):
     if len(args) < 3:
         await message.answer(
             "Использование: /adduser <telegram_id> <имя> [роль]\n\n"
-            "Роли: owner, manager, viewer\n"
+            "Роли: owner, partner\n"
             "Пример: /adduser 123456789 Иван manager")
         return
 
@@ -166,12 +166,12 @@ async def cmd_adduser(message: Message):
 
     name = args[2]
     role_parts = name.rsplit(maxsplit=1)
-    valid_roles = {"owner", "manager", "viewer"}
+    valid_roles = {"owner", "partner"}
     if len(role_parts) == 2 and role_parts[1] in valid_roles:
         name = role_parts[0]
         role = role_parts[1]
     else:
-        role = "manager"
+        role = "partner"
 
     existing = supabase.table("users").select("id").eq("telegram_id", tg_id).execute()
     if existing.data:
@@ -190,6 +190,46 @@ async def cmd_adduser(message: Message):
         await message.answer(f"❌ Ошибка: {e}")
 
 
+@dp.message(Command("addpartner"))
+async def cmd_addpartner(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Нет доступа.")
+        return
+
+    args = message.text.split(maxsplit=2)
+    valid_types = {"partner", "supplier", "client"}
+
+    if len(args) < 3 or args[1] not in valid_types:
+        await message.answer(
+            "Использование: /addpartner <тип> <имя>\n\n"
+            "Типы: partner, supplier, client\n\n"
+            "Примеры:\n"
+            "/addpartner partner Мастер Ли\n"
+            "/addpartner supplier Поставщик Чэн\n"
+            "/addpartner client Клиент Иванов")
+        return
+
+    cp_type = args[1]
+    name = args[2].strip()
+
+    existing = supabase.table("counterparties").select("id").eq("name", name).eq("type", cp_type).execute()
+    if existing.data:
+        await message.answer(f"⚠️ {cp_type} с именем «{name}» уже есть в базе.")
+        return
+
+    type_emoji = {"partner": "📤", "supplier": "🏪", "client": "👤"}
+    try:
+        supabase.table("counterparties").insert({
+            "name": name,
+            "type": cp_type,
+            "is_active": True,
+        }).execute()
+        await message.answer(
+            f"✅ Добавлен {cp_type}:\n{type_emoji[cp_type]} {name}")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+
 @dp.message(Command("listusers"))
 async def cmd_listusers(message: Message):
     if message.from_user.id != ADMIN_ID:
@@ -201,7 +241,7 @@ async def cmd_listusers(message: Message):
         await message.answer("Список пользователей пуст.")
         return
 
-    role_emoji = {"owner": "👑", "manager": "👤", "viewer": "👁"}
+    role_emoji = {"owner": "👑", "partner": "🤝"}
     lines = ["👥 *Пользователи:*\n"]
     for u in res.data:
         emoji = role_emoji.get(u["role"], "👤")
