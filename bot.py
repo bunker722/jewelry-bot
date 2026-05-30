@@ -101,6 +101,25 @@ def get_user_id(telegram_id):
     res = supabase.table("users").select("id").eq("telegram_id", telegram_id).execute()
     return res.data[0]["id"] if res.data else None
 
+def abbr_code(code: str) -> str:
+    parts = code.split("-")
+    if len(parts) == 3 and len(parts[1]) == 4:
+        parts[1] = parts[1][2:]
+    return "-".join(parts)
+
+def abbr_type(full_type: str) -> str:
+    type_map = {"diamond": "Бри", "emerald": "Изу", "ruby": "Руб", "spinel": "Шпи"}
+    origin_map = {"Природный": "прир", "Синтетический": "синт"}
+    if "(" in full_type:
+        name, rest = full_type.split("(", 1)
+        origin = rest.strip(" )")
+        abbr = type_map.get(name.strip(), name.strip()[:3])
+        return f"{abbr}/{origin_map.get(origin, origin[:4])}"
+    return type_map.get(full_type.strip(), full_type.strip()[:3])
+
+def fmt_stone_btn(s: dict) -> str:
+    return f"{abbr_type(s['stone_type'])} {s['carat']}кар · {abbr_code(s['stone_code'])}"
+
 def next_stone_code():
     year = date.today().year
     prefix = f"ST-{year}-"
@@ -338,7 +357,9 @@ def _build_history_text() -> str | None:
     for op in res.data:
         op_type = op_names.get(op["operation_type"], op["operation_type"])
         stone = stones_map.get(op.get("entity_id")) or {}
-        stone_info = f"{stone.get('stone_code', '—')} {stone.get('stone_type', '')} {stone.get('carat', '')}кар".strip()
+        sc = stone.get("stone_code", "")
+        stone_info = (f"{abbr_type(stone['stone_type'])} {stone.get('carat','')}кар · {abbr_code(sc)}"
+                      if sc else "—")
         cp_name = cp_map.get(op.get("counterparty_id"), "")
         amount_str = f"{op['amount']:,.0f} {op['currency']} ({op['amount_cny']:,.0f} CNY)" \
             if op.get("amount") else ""
@@ -366,7 +387,7 @@ async def show_history(callback: CallbackQuery):
 @dp.callback_query(F.data == "action_inventory")
 async def show_inventory(callback: CallbackQuery):
     data = supabase.table("v_stone_current_value") \
-        .select("stone_code,stone_type,carat,status,current_value_cny") \
+        .select("stone_code,stone_type,carat,color,clarity,status,current_value_cny") \
         .not_.in_("status", ["sold", "written_off"]) \
         .order("carat", desc=True).execute()
 
@@ -378,8 +399,14 @@ async def show_inventory(callback: CallbackQuery):
     for s in data.data:
         emoji = get_status_emoji(s["status"])
         status = get_status_name(s["status"])
-        lines.append(f"{emoji} *{s['stone_code']}* — {s['stone_type']}, "
-                    f"{s['carat']} кар\n   {status} · {s['current_value_cny']:,.0f} CNY")
+        color = s.get("color") or ""
+        clarity = s.get("clarity") or ""
+        chars = " · ".join(filter(None, [color, clarity]))
+        lines.append(
+            f"{emoji} *{abbr_type(s['stone_type'])}* {s['carat']}кар"
+            + (f" · {chars}" if chars else "")
+            + f"\n   {status} · {abbr_code(s['stone_code'])} · {s['current_value_cny']:,.0f} CNY"
+        )
 
     kb = InlineKeyboardBuilder()
     kb.button(text="◀️ Меню", callback_data="back_menu")
@@ -976,7 +1003,7 @@ async def sell_step1(callback: CallbackQuery, state: FSMContext):
 
     kb = InlineKeyboardBuilder()
     for s in data.data:
-        kb.button(text=f"{s['stone_code']} — {s['stone_type']} {s['carat']}кар",
+        kb.button(text=fmt_stone_btn(s),
                  callback_data=f"sell_stone_{s['id']}")
     kb.button(text="◀️ Назад", callback_data="back_menu")
     kb.adjust(1)
@@ -993,7 +1020,7 @@ async def sell_step2_price(callback: CallbackQuery, state: FSMContext):
     await state.update_data(stone_id=stone_id, stone_code=stone["stone_code"])
     await state.set_state(SellStone.price)
     await callback.message.edit_text(
-        f"💰 *{stone['stone_code']}* — {stone['stone_type']}, {stone['carat']} кар\n\n"
+        f"💰 *{abbr_type(stone['stone_type'])}* {stone['carat']}кар · `{abbr_code(stone['stone_code'])}`\n\n"
         f"Введи цену продажи:", parse_mode="Markdown")
 
 
@@ -1130,7 +1157,7 @@ async def transfer_step1(callback: CallbackQuery, state: FSMContext):
 
     kb = InlineKeyboardBuilder()
     for s in data.data:
-        kb.button(text=f"{s['stone_code']} — {s['stone_type']} {s['carat']}кар",
+        kb.button(text=fmt_stone_btn(s),
                  callback_data=f"transfer_stone_{s['id']}")
     kb.button(text="◀️ Назад", callback_data="back_menu")
     kb.adjust(1)
