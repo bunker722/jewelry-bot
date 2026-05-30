@@ -316,6 +316,28 @@ async def cmd_deluser(message: Message):
         await message.answer(f"❌ Ошибка: {e}")
 
 
+@dp.message(Command("setcommands"))
+async def cmd_setcommands(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Нет доступа.")
+        return
+    from aiogram.types import BotCommand
+    commands = [
+        BotCommand(command="start",       description="Главное меню"),
+        BotCommand(command="menu",        description="Главное меню"),
+        BotCommand(command="stone",       description="Карточка камня: /stone ST-2026-001"),
+        BotCommand(command="history",     description="Последние 10 операций"),
+        BotCommand(command="cancel",      description="Отменить текущее действие"),
+        BotCommand(command="adduser",     description="Добавить пользователя (admin)"),
+        BotCommand(command="deluser",     description="Удалить пользователя (admin)"),
+        BotCommand(command="listusers",   description="Список пользователей (admin)"),
+        BotCommand(command="addpartner",  description="Добавить контрагента (admin)"),
+        BotCommand(command="setcommands", description="Обновить меню команд (admin)"),
+    ]
+    await bot.set_my_commands(commands)
+    await message.answer("✅ Команды зарегистрированы в меню Telegram.")
+
+
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
     await state.clear()
