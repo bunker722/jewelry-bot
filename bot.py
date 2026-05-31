@@ -486,6 +486,9 @@ async def ask_claude(user_text: str) -> str:
         "передавай в search_query и русское, и английское название через запятую. "
         "Примеры: сапфир→'сапфир,sapphire'; синтетический бриллиант→'синтет,synthetic,diamond'; "
         "рубин→'рубин,ruby'; изумруд→'изумруд,emerald'; шпинель→'шпинель,spinel'. "
+        "Типы операций: purchase_stone=покупка, sale_stone=продажа, "
+        "transfer_to_partner=передача ювелиру, "
+        "return_from_client=возврат от клиента, return_from_partner=возврат от партнёра. "
         f"Сегодня {date.today().strftime('%d.%m.%Y')}."
     )
     messages = [{"role": "user", "content": user_text}]
