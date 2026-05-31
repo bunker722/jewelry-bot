@@ -1,6 +1,7 @@
 import asyncio
 import time
 import json
+import httpx
 import os
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
@@ -315,6 +316,197 @@ def main_keyboard():
     kb.button(text="📊 Экспорт", callback_data="action_export")
     kb.adjust(2, 2, 2)
     return kb.as_markup()
+
+
+# ============================================================
+# AI — Claude
+# ============================================================
+
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+ANTHROPIC_MODEL   = "claude-sonnet-4-20250514"
+
+_AI_TOOLS = [
+    {
+        "name": "get_inventory",
+        "description": "Получить все камни в наличии (не проданные и не списанные) со статусами и стоимостью.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_stone",
+        "description": "Найти камень(ни) по коду или характеристикам.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "stone_code": {"type": "string",  "description": "Код камня, например ST-2026-001"},
+                "stone_type": {"type": "string",  "description": "Тип: diamond, emerald, ruby, spinel или часть названия"},
+                "min_carat":  {"type": "number",  "description": "Минимальный вес в каратах"},
+                "max_carat":  {"type": "number",  "description": "Максимальный вес в каратах"},
+                "status":     {"type": "string",  "description": "in_stock / at_partner / reserved / sent_to_client / in_jewelry / sold / written_off"},
+                "color":      {"type": "string",  "description": "Цвет камня"},
+                "clarity":    {"type": "string",  "description": "Чистота камня"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_operations",
+        "description": "Получить последние операции: покупки, продажи, передачи ювелиру.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "operation_type": {"type": "string",  "description": "purchase_stone / sale_stone / transfer_to_partner"},
+                "limit":          {"type": "integer", "description": "Кол-во записей, по умолчанию 20"},
+                "date_from":      {"type": "string",  "description": "С даты YYYY-MM-DD"},
+                "date_to":        {"type": "string",  "description": "По дату YYYY-MM-DD"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_total",
+        "description": "Итоговая стоимость склада: количество камней, суммарный вес, общая стоимость в USD.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+]
+
+
+def _ai_get_inventory() -> str:
+    data = supabase.table("v_stone_current_value") \
+        .select("stone_code,stone_type,carat,color,clarity,status,current_value_usd") \
+        .not_.in_("status", ["sold", "written_off"]) \
+        .order("carat", desc=True).execute()
+    return json.dumps(data.data or [], ensure_ascii=False)
+
+
+def _ai_get_stone(stone_code=None, stone_type=None, min_carat=None, max_carat=None,
+                  status=None, color=None, clarity=None) -> str:
+    q = supabase.table("v_stone_current_value").select(
+        "stone_code,stone_type,shape,carat,color,clarity,status,"
+        "current_value_usd,purchase_price,purchase_currency,purchase_date"
+    )
+    if stone_code:
+        q = q.ilike("stone_code", f"%{stone_code}%")
+    if stone_type:
+        q = q.ilike("stone_type", f"%{stone_type}%")
+    if min_carat is not None:
+        q = q.gte("carat", min_carat)
+    if max_carat is not None:
+        q = q.lte("carat", max_carat)
+    if status:
+        q = q.eq("status", status)
+    if color:
+        q = q.ilike("color", f"%{color}%")
+    if clarity:
+        q = q.ilike("clarity", f"%{clarity}%")
+    return json.dumps(q.order("carat", desc=True).execute().data or [], ensure_ascii=False)
+
+
+def _ai_get_operations(operation_type=None, limit=20, date_from=None, date_to=None) -> str:
+    q = supabase.table("operations").select(
+        "operation_type,amount,currency,amount_usd,created_at,entity_id,counterparty_id"
+    ).order("created_at", desc=True).limit(int(limit) if limit else 20)
+    if operation_type:
+        q = q.eq("operation_type", operation_type)
+    if date_from:
+        q = q.gte("created_at", date_from)
+    if date_to:
+        q = q.lte("created_at", date_to + "T23:59:59")
+    ops = q.execute().data or []
+
+    stone_ids = list({op["entity_id"] for op in ops if op.get("entity_id")})
+    cp_ids    = list({op["counterparty_id"] for op in ops if op.get("counterparty_id")})
+    stones_map: dict = {}
+    if stone_ids:
+        s = supabase.table("stones").select("id,stone_code,stone_type,carat").in_("id", stone_ids).execute()
+        stones_map = {r["id"]: r for r in (s.data or [])}
+    cp_map: dict = {}
+    if cp_ids:
+        c = supabase.table("counterparties").select("id,name").in_("id", cp_ids).execute()
+        cp_map = {r["id"]: r["name"] for r in (c.data or [])}
+
+    for op in ops:
+        op["stone"] = stones_map.get(op.get("entity_id"))
+        op["counterparty_name"] = cp_map.get(op.get("counterparty_id"))
+    return json.dumps(ops, ensure_ascii=False, default=str)
+
+
+def _ai_get_total() -> str:
+    rows = supabase.table("v_stone_current_value") \
+        .select("current_value_usd,carat") \
+        .not_.in_("status", ["sold", "written_off"]).execute().data or []
+    return json.dumps({
+        "count":       len(rows),
+        "total_carat": round(sum(r["carat"] or 0 for r in rows), 2),
+        "total_usd":   round(sum(r["current_value_usd"] or 0 for r in rows), 2),
+    }, ensure_ascii=False)
+
+
+def _ai_run_tool(name: str, tool_input: dict) -> str:
+    if name == "get_inventory":
+        return _ai_get_inventory()
+    if name == "get_stone":
+        return _ai_get_stone(**tool_input)
+    if name == "get_operations":
+        return _ai_get_operations(**tool_input)
+    if name == "get_total":
+        return _ai_get_total()
+    return json.dumps({"error": f"unknown tool: {name}"})
+
+
+async def ask_claude(user_text: str) -> str:
+    system_prompt = (
+        "Ты помощник для учёта драгоценных камней. У тебя есть доступ к данным склада через инструменты. "
+        "Отвечай на русском языке, кратко и по делу. "
+        "Для получения данных всегда используй инструменты — никогда не выдумывай информацию. "
+        f"Сегодня {date.today().strftime('%d.%m.%Y')}."
+    )
+    messages = [{"role": "user", "content": user_text}]
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        for _ in range(5):
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": ANTHROPIC_MODEL,
+                    "max_tokens": 1024,
+                    "system": [{"type": "text", "text": system_prompt,
+                                "cache_control": {"type": "ephemeral"}}],
+                    "tools": _AI_TOOLS,
+                    "messages": messages,
+                },
+            )
+            resp.raise_for_status()
+            body = resp.json()
+
+            if body["stop_reason"] == "end_turn":
+                for block in body["content"]:
+                    if block["type"] == "text":
+                        return block["text"]
+                return "Нет ответа."
+
+            if body["stop_reason"] == "tool_use":
+                messages.append({"role": "assistant", "content": body["content"]})
+                tool_results = []
+                for block in body["content"]:
+                    if block["type"] == "tool_use":
+                        result = await asyncio.to_thread(
+                            _ai_run_tool, block["name"], block.get("input", {})
+                        )
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block["id"],
+                            "content": result,
+                        })
+                messages.append({"role": "user", "content": tool_results})
+                continue
+            break
+
+    return "Не удалось получить ответ."
 
 
 @dp.message(Command("history"))
@@ -1853,6 +2045,25 @@ async def cmd_stone(message: Message, state: FSMContext):
 # ============================================================
 # Запуск
 # ============================================================
+
+# ============================================================
+# Свободный текст → AI
+# ============================================================
+
+@dp.message(F.text & ~F.text.startswith("/"))
+async def handle_ai(message: Message, state: FSMContext):
+    if await state.get_state() is not None:
+        return
+    if not ANTHROPIC_API_KEY:
+        await message.answer("⚠️ AI не настроен: добавь ANTHROPIC_API_KEY в переменные Railway.")
+        return
+    thinking = await message.answer("🤔")
+    try:
+        answer = await ask_claude(message.text)
+        await thinking.edit_text(answer)
+    except Exception as e:
+        await thinking.edit_text(f"❌ Ошибка AI: {e}")
+
 
 async def main():
     print("Бот запущен...")
