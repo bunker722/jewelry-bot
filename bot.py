@@ -461,6 +461,9 @@ async def ask_claude(user_text: str) -> str:
         "ЗАПРЕЩЕНО использовать таблицы Markdown (| col | col |) — Telegram их не поддерживает. "
         "Список камней выводи отдельными строками в формате: "
         "💎 ST-2026-001 — Рубин, 2.10 кар, Red, VS2 — $6,207. "
+        "Статусы камней всегда переводи на русский: "
+        "in_stock=в наличии, at_partner=у партнёра, reserved=в резерве, "
+        "sold=продан, written_off=списан. "
         f"Сегодня {date.today().strftime('%d.%m.%Y')}."
     )
     messages = [{"role": "user", "content": user_text}]
