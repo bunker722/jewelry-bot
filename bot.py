@@ -421,7 +421,7 @@ def _ai_get_stone(stone_code=None, stone_type=None, min_carat=None, max_carat=No
 
 def _ai_get_operations(operation_type=None, limit=20, date_from=None, date_to=None) -> str:
     q = supabase.table("operations").select(
-        "operation_type,amount,currency,amount_usd,created_at,entity_id,counterparty_id"
+        "operation_type,amount,currency,amount_usd,created_at,entity_id,counterparty_id,notes"
     ).order("created_at", desc=True).limit(int(limit) if limit else 20)
     if operation_type:
         q = q.eq("operation_type", operation_type)
