@@ -328,8 +328,15 @@ ANTHROPIC_MODEL   = "claude-sonnet-4-6"
 _AI_TOOLS = [
     {
         "name": "get_inventory",
-        "description": "Получить все камни в наличии (не проданные и не списанные) со статусами и стоимостью.",
-        "input_schema": {"type": "object", "properties": {}, "required": []},
+        "description": "Получить все камни в наличии (не проданные и не списанные) со статусами и стоимостью. "
+                       "Поддерживает текстовый поиск по типу камня через search_query.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "search_query": {"type": "string", "description": "Текстовый поиск по stone_type (ILIKE). Передавай и русское, и английское слово через запятую, например: сапфир,sapphire"},
+            },
+            "required": [],
+        },
     },
     {
         "name": "get_stone",
@@ -370,12 +377,16 @@ _AI_TOOLS = [
 ]
 
 
-def _ai_get_inventory() -> str:
-    data = supabase.table("v_stone_current_value") \
+def _ai_get_inventory(search_query: str = None) -> str:
+    q = supabase.table("v_stone_current_value") \
         .select("stone_code,stone_type,carat,color,clarity,status,current_value_usd") \
-        .not_.in_("status", ["sold", "written_off"]) \
-        .order("carat", desc=True).execute()
-    return json.dumps(data.data or [], ensure_ascii=False)
+        .not_.in_("status", ["sold", "written_off"])
+    if search_query:
+        terms = [t.strip() for t in search_query.split(",") if t.strip()]
+        if terms:
+            or_filter = ",".join(f"stone_type.ilike.%{t}%" for t in terms)
+            q = q.or_(or_filter)
+    return json.dumps(q.order("carat", desc=True).execute().data or [], ensure_ascii=False)
 
 
 def _ai_get_stone(stone_code=None, stone_type=None, min_carat=None, max_carat=None,
@@ -443,7 +454,7 @@ def _ai_get_total() -> str:
 
 def _ai_run_tool(name: str, tool_input: dict) -> str:
     if name == "get_inventory":
-        return _ai_get_inventory()
+        return _ai_get_inventory(**tool_input)
     if name == "get_stone":
         return _ai_get_stone(**tool_input)
     if name == "get_operations":
@@ -464,6 +475,10 @@ async def ask_claude(user_text: str) -> str:
         "Статусы камней всегда переводи на русский: "
         "in_stock=в наличии, at_partner=у партнёра, reserved=в резерве, "
         "sold=продан, written_off=списан. "
+        "При поиске по типу камня всегда используй ILIKE (частичное совпадение): "
+        "передавай в search_query и русское, и английское название через запятую. "
+        "Примеры: сапфир→'сапфир,sapphire'; синтетический бриллиант→'синтет,synthetic,diamond'; "
+        "рубин→'рубин,ruby'; изумруд→'изумруд,emerald'; шпинель→'шпинель,spinel'. "
         f"Сегодня {date.today().strftime('%d.%m.%Y')}."
     )
     messages = [{"role": "user", "content": user_text}]
