@@ -896,7 +896,7 @@ async def cmd_start(message: Message, state: FSMContext):
 
 def _build_history_text() -> str | None:
     res = supabase.table("operations") \
-        .select("operation_type,amount,currency,amount_usd,created_at,entity_id,counterparty_id") \
+        .select("operation_type,amount,currency,amount_usd,created_at,entity_id,counterparty_id,notes") \
         .order("created_at", desc=True).limit(10).execute()
     if not res.data:
         return None
@@ -919,7 +919,9 @@ def _build_history_text() -> str | None:
     op_names = {
         "sale_stone": "💰 Продажа",
         "transfer_to_partner": "📤 Ювелиру",
-        "purchase_stone": "💎 Покупка",
+        "purchase_stone":        "💎 Покупка",
+        "return_from_client":    "↩️ Возврат от клиента",
+        "return_from_partner":   "↩️ Возврат от партнёра",
     }
 
     lines = ["📋 *Последние 10 операций:*\n"]
@@ -938,6 +940,8 @@ def _build_history_text() -> str | None:
             line += f" → {cp_name}"
         if amount_str:
             line += f"\n  {amount_str}"
+        if op.get("notes"):
+            line += f"\n  📝 {op['notes']}"
         lines.append(line)
 
     return "\n\n".join(lines)
