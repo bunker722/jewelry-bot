@@ -2090,6 +2090,7 @@ async def return_save(callback: CallbackQuery, state: FSMContext):
             "entity_type":    "stone",
             "entity_id":      data["stone_id"],
             "counterparty_id": data.get("counterparty_id"),
+            "notes":           data.get("reason_label"),
             "created_by":      user_id,
         }).execute()
 
