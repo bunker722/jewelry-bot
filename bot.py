@@ -323,7 +323,7 @@ def main_keyboard():
 # ============================================================
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-ANTHROPIC_MODEL   = "claude-sonnet-4-20250514"
+ANTHROPIC_MODEL   = "claude-sonnet-4-6"
 
 _AI_TOOLS = [
     {
