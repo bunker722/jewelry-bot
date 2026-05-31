@@ -1,4 +1,5 @@
 import asyncio
+import time
 import json
 import os
 from dotenv import load_dotenv
@@ -137,6 +138,109 @@ class TransferStone(StatesGroup):
     partner = State()
     new_partner = State()
     confirm = State()
+
+
+# ============================================================
+# PIN — сессии и блокировка
+# ============================================================
+
+PIN_SESSION_SECONDS = 3600
+PIN_MAX_ATTEMPTS    = 3
+PIN_LOCKOUT_SECONDS = 600
+
+_pin_sessions: dict[int, float] = {}
+_pin_failed:   dict[int, int]   = {}
+_pin_locked:   dict[int, float] = {}
+
+
+class PinVerify(StatesGroup):
+    enter = State()
+
+class PinSetup(StatesGroup):
+    enter_new = State()
+    confirm   = State()
+
+class PinChange(StatesGroup):
+    verify_old  = State()
+    enter_new   = State()
+    confirm_new = State()
+
+
+def _pin_session_active(user_id: int) -> bool:
+    return time.time() < _pin_sessions.get(user_id, 0)
+
+def _start_pin_session(user_id: int) -> None:
+    _pin_sessions[user_id] = time.time() + PIN_SESSION_SECONDS
+    _pin_failed.pop(user_id, None)
+    _pin_locked.pop(user_id, None)
+
+def _pin_lockout_remaining(user_id: int) -> float:
+    return max(0.0, _pin_locked.get(user_id, 0) - time.time())
+
+def _record_failed_pin(user_id: int) -> int:
+    count = _pin_failed.get(user_id, 0) + 1
+    _pin_failed[user_id] = count
+    if count >= PIN_MAX_ATTEMPTS:
+        _pin_locked[user_id] = time.time() + PIN_LOCKOUT_SECONDS
+    return count
+
+
+_PIN_BYPASS_STATES = frozenset({
+    PinVerify.enter.state,
+    PinSetup.enter_new.state, PinSetup.confirm.state,
+    PinChange.verify_old.state, PinChange.enter_new.state, PinChange.confirm_new.state,
+})
+
+
+class PinMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event: TelegramObject, data: dict):
+        user = data.get("event_from_user")
+        if not user:
+            return await handler(event, data)
+
+        state: FSMContext = data.get("state")
+        if state and (await state.get_state()) in _PIN_BYPASS_STATES:
+            return await handler(event, data)
+
+        if _pin_session_active(user.id):
+            return await handler(event, data)
+
+        remaining = _pin_lockout_remaining(user.id)
+        if remaining > 0:
+            mins = int(remaining // 60) + 1
+            text = f"🔒 Слишком много неверных попыток. Попробуй через {mins} мин."
+            if isinstance(event, Message):
+                await event.answer(text)
+            elif isinstance(event, CallbackQuery):
+                await event.answer(text, show_alert=True)
+            return
+
+        res = supabase.table("users").select("pin_code").eq("telegram_id", user.id).execute()
+        if not res.data:
+            return
+
+        if state:
+            await state.clear()
+
+        pin_code = (res.data[0].get("pin_code") or "").strip()
+        if not pin_code:
+            await state.set_state(PinSetup.enter_new)
+            text = "🔐 *Добро пожаловать!*\n\nУстанови PIN-код — 4 цифры:"
+            pm = "Markdown"
+        else:
+            await state.set_state(PinVerify.enter)
+            text = "🔐 Введи PIN-код:"
+            pm = None
+
+        if isinstance(event, Message):
+            await event.answer(text, parse_mode=pm)
+        elif isinstance(event, CallbackQuery):
+            await event.answer()
+            await event.message.answer(text, parse_mode=pm)
+
+
+dp.message.middleware(PinMiddleware())
+dp.callback_query.middleware(PinMiddleware())
 
 
 # ============================================================
@@ -383,6 +487,7 @@ async def cmd_setcommands(message: Message):
         BotCommand(command="adduser",     description="Добавить пользователя (admin)"),
         BotCommand(command="deluser",     description="Удалить пользователя (admin)"),
         BotCommand(command="listusers",   description="Список пользователей (admin)"),
+        BotCommand(command="setpin",       description="Сменить PIN-код"),
         BotCommand(command="addpartner",  description="Добавить контрагента (admin)"),
         BotCommand(command="setcommands", description="Обновить меню команд (admin)"),
     ]
@@ -390,8 +495,169 @@ async def cmd_setcommands(message: Message):
     await message.answer("✅ Команды зарегистрированы в меню Telegram.")
 
 
+# ============================================================
+# PIN — обработчики
+# ============================================================
+
+@dp.message(PinSetup.enter_new)
+async def pin_setup_new(message: Message, state: FSMContext):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    pin = message.text.strip() if message.text else ""
+    if not pin.isdigit() or len(pin) != 4:
+        await message.answer("❌ PIN должен быть ровно 4 цифры. Попробуй ещё раз:")
+        return
+    await state.update_data(new_pin=pin)
+    await state.set_state(PinSetup.confirm)
+    await message.answer("🔐 Повтори PIN:")
+
+
+@dp.message(PinSetup.confirm)
+async def pin_setup_confirm(message: Message, state: FSMContext):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    data = await state.get_data()
+    pin = message.text.strip() if message.text else ""
+    if pin != data.get("new_pin"):
+        await state.set_state(PinSetup.enter_new)
+        await message.answer("❌ PIN не совпадает. Введи заново (4 цифры):")
+        return
+    try:
+        supabase.table("users").update({"pin_code": pin}) \
+            .eq("telegram_id", message.from_user.id).execute()
+    except Exception as e:
+        await message.answer(f"❌ Ошибка сохранения: {e}")
+        return
+    _start_pin_session(message.from_user.id)
+    await state.clear()
+    await message.answer("✅ PIN установлен!\n\n💎 *Jewelry AI*\n\nВыбери действие:",
+                         reply_markup=main_keyboard(), parse_mode="Markdown")
+
+
+@dp.message(PinVerify.enter)
+async def pin_verify(message: Message, state: FSMContext):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    user_id = message.from_user.id
+    remaining = _pin_lockout_remaining(user_id)
+    if remaining > 0:
+        mins = int(remaining // 60) + 1
+        await message.answer(f"🔒 Аккаунт заблокирован. Попробуй через {mins} мин.")
+        return
+    pin = message.text.strip() if message.text else ""
+    res = supabase.table("users").select("pin_code").eq("telegram_id", user_id).execute()
+    correct = res.data[0]["pin_code"] if res.data else None
+    if pin == correct:
+        _start_pin_session(user_id)
+        await state.clear()
+        await message.answer("💎 *Jewelry AI*\n\nВыбери действие:",
+                             reply_markup=main_keyboard(), parse_mode="Markdown")
+    else:
+        count = _record_failed_pin(user_id)
+        if _pin_lockout_remaining(user_id) > 0:
+            await message.answer(
+                f"❌ Неверный PIN. Аккаунт заблокирован на {PIN_LOCKOUT_SECONDS // 60} мин.")
+        else:
+            left = PIN_MAX_ATTEMPTS - count
+            await message.answer(f"❌ Неверный PIN. Осталось попыток: {left}")
+
+
+@dp.message(Command("setpin"))
+async def cmd_setpin(message: Message, state: FSMContext):
+    res = supabase.table("users").select("pin_code").eq("telegram_id", message.from_user.id).execute()
+    has_pin = bool(res.data and (res.data[0].get("pin_code") or "").strip())
+    if has_pin:
+        await state.set_state(PinChange.verify_old)
+        await message.answer("🔐 Введи текущий PIN:")
+    else:
+        await state.set_state(PinSetup.enter_new)
+        await message.answer("🔐 Установи новый PIN (4 цифры):")
+
+
+@dp.message(PinChange.verify_old)
+async def pin_change_old(message: Message, state: FSMContext):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    user_id = message.from_user.id
+    remaining = _pin_lockout_remaining(user_id)
+    if remaining > 0:
+        mins = int(remaining // 60) + 1
+        await message.answer(f"🔒 Аккаунт заблокирован. Попробуй через {mins} мин.")
+        await state.clear()
+        return
+    pin = message.text.strip() if message.text else ""
+    res = supabase.table("users").select("pin_code").eq("telegram_id", user_id).execute()
+    correct = res.data[0]["pin_code"] if res.data else None
+    if pin == correct:
+        _pin_failed.pop(user_id, None)
+        _pin_locked.pop(user_id, None)
+        await state.set_state(PinChange.enter_new)
+        await message.answer("🔐 Введи новый PIN (4 цифры):")
+    else:
+        count = _record_failed_pin(user_id)
+        if _pin_lockout_remaining(user_id) > 0:
+            await message.answer(
+                f"❌ Неверный PIN. Аккаунт заблокирован на {PIN_LOCKOUT_SECONDS // 60} мин.")
+            await state.clear()
+        else:
+            left = PIN_MAX_ATTEMPTS - count
+            await message.answer(f"❌ Неверный PIN. Осталось попыток: {left}")
+
+
+@dp.message(PinChange.enter_new)
+async def pin_change_new(message: Message, state: FSMContext):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    pin = message.text.strip() if message.text else ""
+    if not pin.isdigit() or len(pin) != 4:
+        await message.answer("❌ PIN должен быть 4 цифры:")
+        return
+    await state.update_data(new_pin=pin)
+    await state.set_state(PinChange.confirm_new)
+    await message.answer("🔐 Повтори новый PIN:")
+
+
+@dp.message(PinChange.confirm_new)
+async def pin_change_confirm(message: Message, state: FSMContext):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    data = await state.get_data()
+    pin = message.text.strip() if message.text else ""
+    if pin != data.get("new_pin"):
+        await state.set_state(PinChange.enter_new)
+        await message.answer("❌ PIN не совпадает. Введи новый PIN (4 цифры):")
+        return
+    try:
+        supabase.table("users").update({"pin_code": pin}) \
+            .eq("telegram_id", message.from_user.id).execute()
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+        return
+    _start_pin_session(message.from_user.id)
+    await state.clear()
+    kb = InlineKeyboardBuilder()
+    kb.button(text="◀️ Меню", callback_data="back_menu")
+    await message.answer("✅ PIN успешно изменён!", reply_markup=kb.as_markup())
+
+
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
+    current = await state.get_state()
+    if current in {PinVerify.enter.state, PinSetup.enter_new.state, PinSetup.confirm.state}:
+        await message.answer("🔐 Введи PIN-код для продолжения:")
+        return
     await state.clear()
     await message.answer("❌ Отменено.\n\n💎 *Jewelry AI*\n\nВыбери действие:",
                         reply_markup=main_keyboard(), parse_mode="Markdown")
