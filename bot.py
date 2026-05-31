@@ -140,6 +140,12 @@ class TransferStone(StatesGroup):
     new_partner = State()
     confirm = State()
 
+class ReturnStone(StatesGroup):
+    select_stone  = State()
+    counterparty  = State()
+    reason        = State()
+    confirm       = State()
+
 
 # ============================================================
 # PIN — сессии и блокировка
@@ -311,10 +317,11 @@ def main_keyboard():
     kb.button(text="💎 Купили", callback_data="action_buy")
     kb.button(text="💰 Продали", callback_data="action_sell")
     kb.button(text="📤 Ювелиру", callback_data="action_transfer")
+    kb.button(text="↩️ Возврат", callback_data="action_return")
     kb.button(text="📋 Склад", callback_data="action_inventory")
     kb.button(text="💵 Итого", callback_data="action_total")
     kb.button(text="📊 Экспорт", callback_data="action_export")
-    kb.adjust(2, 2, 2)
+    kb.adjust(2, 2, 2, 1)
     return kb.as_markup()
 
 
@@ -1964,6 +1971,136 @@ async def transfer_save(callback: CallbackQuery, state: FSMContext):
         kb.button(text="◀️ Меню", callback_data="back_menu")
         await callback.message.edit_text(
             f"✅ *Передача записана!*\n\n{data['stone_code']} → {data['partner_name']}",
+            reply_markup=kb.as_markup(), parse_mode="Markdown")
+    except Exception as e:
+        await callback.message.edit_text(f"❌ Ошибка: {e}")
+
+
+# ============================================================
+# ВОЗВРАТ
+# ============================================================
+
+_RETURN_REASONS = [
+    ("Не подошёл",  "not_fit"),
+    ("Дефект",      "defect"),
+    ("Другое",      "other"),
+]
+
+@dp.callback_query(F.data == "action_return")
+async def return_step1(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    data = supabase.table("stones").select("id,stone_code,stone_type,carat,status") \
+        .in_("status", ["sold", "at_partner"]).order("created_at", desc=True).execute()
+
+    if not data.data:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="◀️ Меню", callback_data="back_menu")
+        await callback.message.edit_text(
+            "Нет камней для возврата (нет проданных или у партнёра).",
+            reply_markup=kb.as_markup())
+        return
+
+    kb = InlineKeyboardBuilder()
+    for s in data.data:
+        status_label = "продан" if s["status"] == "sold" else "у партнёра"
+        btn_text = f"{fmt_stone_btn(s)}  [{status_label}]"
+        kb.button(text=btn_text, callback_data=f"ret_stone_{s['id']}")
+    kb.button(text="◀️ Назад", callback_data="back_menu")
+    kb.adjust(1)
+    await state.set_state(ReturnStone.select_stone)
+    await callback.message.edit_text("↩️ *Возврат — выбери камень:*",
+                                     reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
+@dp.callback_query(ReturnStone.select_stone, F.data.startswith("ret_stone_"))
+async def return_step2_counterparty(callback: CallbackQuery, state: FSMContext):
+    stone_id = callback.data.replace("ret_stone_", "")
+    res = supabase.table("stones").select("stone_code,stone_type,carat,status").eq("id", stone_id).execute()
+    stone = res.data[0]
+    await state.update_data(stone_id=stone_id, stone_code=stone["stone_code"],
+                            original_status=stone["status"])
+
+    cp_type = "client" if stone["status"] == "sold" else "partner"
+    cp_label = "клиента" if cp_type == "client" else "партнёра"
+    counterparties = supabase.table("counterparties").select("id,name") \
+        .eq("type", cp_type).execute().data or []
+
+    kb = InlineKeyboardBuilder()
+    for c in counterparties:
+        kb.button(text=c["name"], callback_data=f"ret_cp_{c['id']}")
+    kb.button(text="◀️ Назад", callback_data="action_return")
+    kb.adjust(1)
+    await state.set_state(ReturnStone.counterparty)
+    await callback.message.edit_text(
+        f"↩️ *Возврат камня* `{stone['stone_code']}`\n\nОт кого возврат ({cp_label})?",
+        reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
+@dp.callback_query(ReturnStone.counterparty, F.data.startswith("ret_cp_"))
+async def return_step3_reason(callback: CallbackQuery, state: FSMContext):
+    cp_id = callback.data.replace("ret_cp_", "")
+    res = supabase.table("counterparties").select("name").eq("id", cp_id).execute()
+    cp_name = res.data[0]["name"] if res.data else "—"
+    await state.update_data(counterparty_id=cp_id, counterparty_name=cp_name)
+
+    kb = InlineKeyboardBuilder()
+    for label, key in _RETURN_REASONS:
+        kb.button(text=label, callback_data=f"ret_reason_{key}")
+    kb.button(text="◀️ Назад", callback_data="action_return")
+    kb.adjust(1)
+    await state.set_state(ReturnStone.reason)
+    await callback.message.edit_text("↩️ *Причина возврата?*",
+                                     reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
+@dp.callback_query(ReturnStone.reason, F.data.startswith("ret_reason_"))
+async def return_step4_confirm(callback: CallbackQuery, state: FSMContext):
+    reason_key = callback.data.replace("ret_reason_", "")
+    reason_label = next((lbl for lbl, k in _RETURN_REASONS if k == reason_key), reason_key)
+    await state.update_data(reason=reason_key, reason_label=reason_label)
+    data = await state.get_data()
+
+    op_type = "return_from_client" if data["original_status"] == "sold" else "return_from_partner"
+    await state.update_data(op_type=op_type)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Подтвердить", callback_data="ret_confirm_yes")
+    kb.button(text="❌ Отмена", callback_data="back_menu")
+    kb.adjust(1)
+    await state.set_state(ReturnStone.confirm)
+    await callback.message.edit_text(
+        f"↩️ *Подтверди возврат:*\n\n"
+        f"Камень: `{data['stone_code']}`\n"
+        f"От: {data['counterparty_name']}\n"
+        f"Причина: {reason_label}\n"
+        f"Новый статус: в наличии",
+        reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
+@dp.callback_query(ReturnStone.confirm, F.data == "ret_confirm_yes")
+async def return_save(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    user_id = get_user_id(callback.from_user.id)
+
+    try:
+        supabase.table("stones").update({"status": "in_stock"}) \
+            .eq("id", data["stone_id"]).execute()
+        supabase.table("operations").insert({
+            "operation_type": data["op_type"],
+            "entity_type":    "stone",
+            "entity_id":      data["stone_id"],
+            "counterparty_id": data.get("counterparty_id"),
+            "created_by":      user_id,
+        }).execute()
+
+        await state.clear()
+        kb = InlineKeyboardBuilder()
+        kb.button(text="◀️ Меню", callback_data="back_menu")
+        await callback.message.edit_text(
+            f"✅ *Возврат записан!*\n\n"
+            f"{data['stone_code']} → в наличии\n"
+            f"От: {data['counterparty_name']}\n"
+            f"Причина: {data['reason_label']}",
             reply_markup=kb.as_markup(), parse_mode="Markdown")
     except Exception as e:
         await callback.message.edit_text(f"❌ Ошибка: {e}")
