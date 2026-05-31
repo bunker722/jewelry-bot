@@ -144,7 +144,7 @@ class TransferStone(StatesGroup):
 # PIN — сессии и блокировка
 # ============================================================
 
-PIN_SESSION_SECONDS = 3600
+PIN_SESSION_SECONDS = 900
 PIN_MAX_ATTEMPTS    = 3
 PIN_LOCKOUT_SECONDS = 600
 
