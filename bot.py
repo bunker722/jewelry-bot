@@ -117,6 +117,7 @@ class BuyStone(StatesGroup):
     color = State()
     clarity = State()
     price = State()
+    price_confirm = State()
     currency = State()
     exchange_rate = State()
     supplier = State()
@@ -1407,20 +1408,31 @@ async def buy_step6_clarity_text(message: Message, state: FSMContext):
 # ============================================================
 
 async def buy_step7_price_cb(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    is_natural = data.get("origin") == "Природный"
+    prompt = ("💵 *Цена за карат?*\n\nВведи сумму (например: 800):" if is_natural
+              else "💵 *Цена за камень?*\n\nВведи сумму (например: 5000):")
     await state.set_state(BuyStone.price)
-    await callback.message.edit_text("💵 *Цена покупки?*\n\nВведи сумму (например: 15000):")
+    await callback.message.edit_text(prompt, parse_mode="Markdown")
 
 async def buy_step7_price_msg(message: Message, state: FSMContext):
+    data = await state.get_data()
+    is_natural = data.get("origin") == "Природный"
+    prompt = ("💵 *Цена за карат?*\n\nВведи сумму (например: 800):" if is_natural
+              else "💵 *Цена за камень?*\n\nВведи сумму (например: 5000):")
     await state.set_state(BuyStone.price)
-    await message.answer("💵 *Цена покупки?*\n\nВведи сумму (например: 15000):",
-                        parse_mode="Markdown")
+    await message.answer(prompt, parse_mode="Markdown")
 
 
 @dp.message(BuyStone.price)
 async def buy_step7_price_entered(message: Message, state: FSMContext):
     try:
-        price = float(message.text.strip().replace(",", ".").replace(" ", ""))
-        await state.update_data(price=price)
+        val = float(message.text.strip().replace(",", ".").replace(" ", ""))
+        data = await state.get_data()
+        if data.get("origin") == "Природный":
+            await state.update_data(price_per_carat=val)
+        else:
+            await state.update_data(price=val)
         kb = InlineKeyboardBuilder()
         for cur in ["CNY", "USD", "THB", "RUB"]:
             kb.button(text=cur, callback_data=f"currency_{cur}")
@@ -1428,12 +1440,65 @@ async def buy_step7_price_entered(message: Message, state: FSMContext):
         await state.set_state(BuyStone.currency)
         await message.answer("💱 *Валюта?*", reply_markup=kb.as_markup(), parse_mode="Markdown")
     except:
-        await message.answer("❌ Введи число, например: 15000")
+        await message.answer("❌ Введи число, например: 800")
 
 
 # ============================================================
 # КУПИЛИ — шаг 8: валюта → курс → поставщик
 # ============================================================
+
+async def _show_price_summary(target, state: FSMContext):
+    data = await state.get_data()
+    origin = data.get("origin", "")
+    currency = data.get("currency", "USD")
+    rate = data.get("exchange_rate", 1.0) or 1.0
+
+    if origin == "Природный":
+        carat = data.get("carat", 0)
+        ppc = data.get("price_per_carat", 0)
+        total = round(carat * ppc, 2)
+        await state.update_data(price=total)
+        carat_str = f"{carat:g}"
+        if currency == "USD":
+            summary = f"{carat_str} × {ppc:,.0f} USD = *${total:,.0f}*"
+        else:
+            total_usd = round(total / rate, 2)
+            summary = (f"{carat_str} × {ppc:,.0f} {currency} = "
+                       f"{total:,.0f} {currency} = *${total_usd:,.0f} USD*")
+    else:
+        price = data.get("price", 0)
+        if currency == "USD":
+            summary = f"*${price:,.0f} USD*"
+        else:
+            price_usd = round(price / rate, 2)
+            summary = f"{price:,.0f} {currency} = *${price_usd:,.0f} USD*"
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Верно", callback_data="price_ok")
+    kb.button(text="✏️ Изменить", callback_data="price_edit")
+    kb.adjust(2)
+    await state.set_state(BuyStone.price_confirm)
+    text = f"💵 *Итого:*\n\n{summary}"
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+    else:
+        await target.answer(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
+@dp.callback_query(BuyStone.price_confirm, F.data == "price_ok")
+async def buy_price_confirmed(callback: CallbackQuery, state: FSMContext):
+    await _show_buy_supplier(callback, state)
+
+
+@dp.callback_query(BuyStone.price_confirm, F.data == "price_edit")
+async def buy_price_edit(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    is_natural = data.get("origin") == "Природный"
+    prompt = ("💵 *Цена за карат?*\n\nВведи сумму (например: 800):" if is_natural
+              else "💵 *Цена за камень?*\n\nВведи сумму (например: 5000):")
+    await state.set_state(BuyStone.price)
+    await callback.message.edit_text(prompt, parse_mode="Markdown")
+
 
 async def _show_buy_supplier(target, state: FSMContext):
     res = supabase.table("counterparties").select("id,name").eq("type", "supplier").execute()
@@ -1455,11 +1520,11 @@ async def buy_step8_currency(callback: CallbackQuery, state: FSMContext):
     await state.update_data(currency=currency)
     if currency == "USD":
         await state.update_data(exchange_rate=1.0)
-        await _show_buy_supplier(callback, state)
+        await _show_price_summary(callback, state)
     else:
         await state.set_state(BuyStone.exchange_rate)
         await callback.message.edit_text(
-            f"💱 *Курс на момент сделки:*\n1 USD = ? {currency}\n\nВведи число (например: 7.25):",
+            f"💱 *Курс к USD сегодня?*\n1 USD = ? {currency}\n\nВведи число (например: 7.25):",
             parse_mode="Markdown")
 
 @dp.message(BuyStone.exchange_rate)
@@ -1469,7 +1534,7 @@ async def buy_step8_rate(message: Message, state: FSMContext):
         if rate <= 0:
             raise ValueError
         await state.update_data(exchange_rate=rate)
-        await _show_buy_supplier(message, state)
+        await _show_price_summary(message, state)
     except:
         await message.answer("❌ Введи число больше нуля, например: 7.25")
 
