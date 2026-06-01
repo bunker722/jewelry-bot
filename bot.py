@@ -108,6 +108,7 @@ dp.callback_query.middleware(AccessMiddleware())
 class BuyStone(StatesGroup):
     stone_type = State()
     stone_type_custom = State()
+    stone_search = State()
     origin = State()
     shape = State()
     shape_custom = State()
@@ -277,6 +278,13 @@ def abbr_code(code: str) -> str:
 
 def abbr_color(c: str) -> str:
     return c if len(c) <= 5 else c[:4] + "."
+
+_SEARCH_STONES = [
+    "Аквамарин", "Александрит", "Аметист", "Гранат", "Жемчуг",
+    "Опал", "Сапфир", "Танзанит", "Топаз", "Турмалин",
+    "Хризолит", "Цаворит", "Янтарь",
+]
+
 
 def abbr_type(full_type: str) -> str:
     type_map = {"diamond": "Бри", "emerald": "Изу", "ruby": "Руб", "spinel": "Шпи"}
@@ -1093,7 +1101,7 @@ async def buy_step1_type(callback: CallbackQuery, state: FSMContext):
     kb.button(text="💚 Изумруд", callback_data="type_emerald")
     kb.button(text="🔴 Рубин", callback_data="type_ruby")
     kb.button(text="🩷 Шпинель", callback_data="type_spinel")
-    kb.button(text="✏️ Другой камень", callback_data="type_custom")
+    kb.button(text="🔍 Найти камень", callback_data="type_search")
     kb.button(text="◀️ Назад", callback_data="back_menu")
     kb.adjust(2, 2, 1, 1)
     await state.set_state(BuyStone.stone_type)
@@ -1105,7 +1113,7 @@ async def buy_step1_type(callback: CallbackQuery, state: FSMContext):
 # КУПИЛИ — шаг 2: происхождение
 # ============================================================
 
-@dp.callback_query(BuyStone.stone_type, F.data.startswith("type_"), F.data != "type_custom")
+@dp.callback_query(BuyStone.stone_type, F.data.in_({"type_diamond", "type_emerald", "type_ruby", "type_spinel"}))
 async def buy_step2_origin(callback: CallbackQuery, state: FSMContext):
     type_map = {"type_diamond": "diamond", "type_emerald": "emerald",
                 "type_ruby": "ruby", "type_spinel": "spinel"}
@@ -1147,6 +1155,58 @@ async def buy_step1_type_custom_text(message: Message, state: FSMContext):
     await state.set_state(BuyStone.origin)
     await message.answer(f"*{stone_type}*\n\n🌍 Происхождение?",
                          reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
+@dp.callback_query(BuyStone.stone_type, F.data == "type_search")
+async def buy_step1_type_search(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(BuyStone.stone_search)
+    await callback.message.edit_text("🔍 Напиши название камня или первые буквы:")
+
+
+@dp.message(BuyStone.stone_search)
+async def buy_step1_search_query(message: Message, state: FSMContext):
+    query = message.text.strip().lower()
+    matches = [s for s in _SEARCH_STONES if s.lower().startswith(query)]
+    if not matches:
+        matches = [s for s in _SEARCH_STONES if query in s.lower()]
+
+    kb = InlineKeyboardBuilder()
+    if matches:
+        for stone in matches:
+            kb.button(text=stone, callback_data=f"found_{stone}")
+        kb.button(text="✏️ Ввести вручную", callback_data="manual_input")
+        kb.adjust(2)
+        await message.answer("🔍 Выбери камень:", reply_markup=kb.as_markup())
+    else:
+        kb.button(text="✏️ Ввести вручную", callback_data="manual_input")
+        kb.button(text="◀️ Назад", callback_data="action_buy")
+        kb.adjust(1)
+        await message.answer(
+            "❌ Камень не найден. Попробуй другой запрос или введи название вручную:",
+            reply_markup=kb.as_markup()
+        )
+
+
+@dp.callback_query(BuyStone.stone_search, F.data.startswith("found_"))
+async def buy_step1_found_selected(callback: CallbackQuery, state: FSMContext):
+    stone_name = callback.data.replace("found_", "")
+    await state.update_data(stone_type=stone_name)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🌍 Природный", callback_data="origin_natural")
+    kb.button(text="🔬 Синтетический", callback_data="origin_synthetic")
+    kb.button(text="◀️ Назад", callback_data="action_buy")
+    kb.adjust(2, 1)
+    await state.set_state(BuyStone.origin)
+    await callback.message.edit_text(
+        f"*{stone_name}*\n\n🌍 Происхождение?",
+        reply_markup=kb.as_markup(), parse_mode="Markdown"
+    )
+
+
+@dp.callback_query(BuyStone.stone_search, F.data == "manual_input")
+async def buy_step1_search_manual(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(BuyStone.stone_type_custom)
+    await callback.message.edit_text("✏️ Введи название камня:")
 
 
 @dp.callback_query(BuyStone.origin, F.data.startswith("origin_"))
