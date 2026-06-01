@@ -1646,7 +1646,7 @@ async def _ask_certificate(target):
 
 
 async def _ask_photo_before_confirm(target, state: FSMContext):
-    await state.update_data(media=[])
+    await state.update_data(media=[], media_msg_id=None)
     await state.set_state(BuyStone.photo)
     text = "📸 Загрузи фото/видео камня (до 4 штук)\nМожно отправить пачкой или по одному:"
     kb = InlineKeyboardBuilder()
@@ -1770,20 +1770,46 @@ async def buy_media_received(message: Message, state: FSMContext):
         if len(media) >= 4:
             return
         media.append({"type": media_type, "file_id": file_id})
-        await state.update_data(media=media)
         n = len(media)
+        media_msg_id: int | None = data.get("media_msg_id")
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text="✅ Готово", callback_data="media_done")
+        kb.button(text="⏭ Пропустить", callback_data="skip_media")
+        kb.adjust(2)
+
+        if n >= 4:
+            text = "📸 *Добавлено медиа: 4 из 4* — лимит достигнут"
+            if media_msg_id:
+                try:
+                    await bot.edit_message_text(
+                        text, chat_id=message.chat.id,
+                        message_id=media_msg_id, parse_mode="Markdown")
+                except Exception:
+                    await message.answer(text, parse_mode="Markdown")
+            else:
+                await message.answer(text, parse_mode="Markdown")
+            await state.update_data(media=media)
+        else:
+            text = (f"📸 *Добавлено медиа: {n} из 4*\n\n"
+                    f"Можно добавить ещё или нажать Готово:")
+            if media_msg_id:
+                try:
+                    await bot.edit_message_text(
+                        text, chat_id=message.chat.id, message_id=media_msg_id,
+                        reply_markup=kb.as_markup(), parse_mode="Markdown")
+                    await state.update_data(media=media)
+                except Exception:
+                    sent = await message.answer(
+                        text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+                    await state.update_data(media=media, media_msg_id=sent.message_id)
+            else:
+                sent = await message.answer(
+                    text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+                await state.update_data(media=media, media_msg_id=sent.message_id)
 
     if n >= 4:
         await _ask_cert_before_confirm(message, state)
-        return
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Готово", callback_data="media_done")
-    kb.button(text="⏭ Пропустить", callback_data="skip_media")
-    kb.adjust(2)
-    await message.answer(
-        f"📸 *Добавлено медиа: {n} из 4*\n\nМожно добавить ещё или нажать Готово:",
-        reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 
 @dp.callback_query(BuyStone.photo, F.data == "media_done")
@@ -1795,7 +1821,7 @@ async def buy_media_done(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(BuyStone.photo, F.data == "skip_media")
 async def buy_photo_skip(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    await state.update_data(media=[])
+    await state.update_data(media=[], media_msg_id=None)
     await _ask_cert_before_confirm(callback, state)
 
 
