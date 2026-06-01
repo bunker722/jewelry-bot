@@ -75,8 +75,7 @@ class SupabaseFSMStorage(BaseStorage):
 
 
 bot = Bot(token=BOT_TOKEN)
-_bot_id = int(BOT_TOKEN.split(":")[0])
-_media_group_buffer: dict[str, dict] = {}
+_user_media_locks: dict[int, asyncio.Lock] = {}
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 storage = SupabaseFSMStorage(supabase)
 dp = Dispatcher(storage=storage)
@@ -1749,44 +1748,8 @@ async def _insert_stone(callback: CallbackQuery, state: FSMContext, data: dict):
 
 
 # ============================================================
-# КУПИЛИ — фото камня (медиа-группы до 4 файлов)
+# КУПИЛИ — медиа до 4 файлов (фото/видео/gif)
 # ============================================================
-
-async def _flush_media_group(gid: str, chat_id: int, user_id: int) -> None:
-    try:
-        await asyncio.sleep(1.0)
-    except asyncio.CancelledError:
-        return
-    buf = _media_group_buffer.pop(gid, None)
-    if not buf:
-        return
-    key = StorageKey(bot_id=_bot_id, chat_id=chat_id, user_id=user_id, destiny="fsm")
-    ctx = FSMContext(storage=storage, key=key)
-    if await ctx.get_state() != BuyStone.photo.state:
-        return
-    data = await ctx.get_data()
-    media: list = list(data.get("media") or [])
-    for item in buf["items"]:
-        if len(media) >= 4:
-            break
-        media.append(item)
-    await ctx.update_data(media=media)
-    n = len(media)
-    if n >= 4:
-        await ctx.set_state(BuyStone.certificate)
-        await bot.send_message(
-            chat_id, "📄 Есть сертификат? Загрузи фото или нажми Пропустить:",
-            reply_markup=_skip_kb())
-        return
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Готово", callback_data="media_done")
-    kb.button(text="⏭ Пропустить", callback_data="skip_media")
-    kb.adjust(2)
-    await bot.send_message(
-        chat_id,
-        f"📸 *Добавлено медиа: {n} из 4*\n\nМожно добавить ещё или нажать Готово:",
-        reply_markup=kb.as_markup(), parse_mode="Markdown")
-
 
 @dp.message(BuyStone.photo, F.photo | F.video | F.animation)
 async def buy_media_received(message: Message, state: FSMContext):
@@ -1796,35 +1759,31 @@ async def buy_media_received(message: Message, state: FSMContext):
         file_id, media_type = message.video.file_id, "video"
     else:
         file_id, media_type = message.photo[-1].file_id, "photo"
-    item = {"type": media_type, "file_id": file_id}
 
-    if message.media_group_id and not message.animation:
-        gid = message.media_group_id
-        if gid not in _media_group_buffer:
-            _media_group_buffer[gid] = {"items": [], "task": None}
-        buf = _media_group_buffer[gid]
-        buf["items"].append(item)
-        if buf["task"] and not buf["task"].done():
-            buf["task"].cancel()
-        buf["task"] = asyncio.create_task(
-            _flush_media_group(gid, message.chat.id, message.from_user.id))
-    else:
+    uid = message.from_user.id
+    if uid not in _user_media_locks:
+        _user_media_locks[uid] = asyncio.Lock()
+
+    async with _user_media_locks[uid]:
         data = await state.get_data()
         media: list = list(data.get("media") or [])
-        if len(media) < 4:
-            media.append(item)
+        if len(media) >= 4:
+            return
+        media.append({"type": media_type, "file_id": file_id})
         await state.update_data(media=media)
         n = len(media)
-        if n >= 4:
-            await _ask_cert_before_confirm(message, state)
-            return
-        kb = InlineKeyboardBuilder()
-        kb.button(text="✅ Готово", callback_data="media_done")
-        kb.button(text="⏭ Пропустить", callback_data="skip_media")
-        kb.adjust(2)
-        await message.answer(
-            f"📸 *Добавлено медиа: {n} из 4*\n\nМожно добавить ещё или нажать Готово:",
-            reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+    if n >= 4:
+        await _ask_cert_before_confirm(message, state)
+        return
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Готово", callback_data="media_done")
+    kb.button(text="⏭ Пропустить", callback_data="skip_media")
+    kb.adjust(2)
+    await message.answer(
+        f"📸 *Добавлено медиа: {n} из 4*\n\nМожно добавить ещё или нажать Готово:",
+        reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 
 @dp.callback_query(BuyStone.photo, F.data == "media_done")
