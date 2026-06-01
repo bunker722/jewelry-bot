@@ -1555,25 +1555,7 @@ async def buy_step8_supplier_new_name(message: Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"❌ Ошибка сохранения: {e}")
         return
-    await state.set_state(BuyStone.confirm)
-    data = await state.get_data()
-    type_name = {"diamond": "Бриллиант", "emerald": "Изумруд",
-                 "ruby": "Рубин", "spinel": "Шпинель"}.get(data.get("stone_type"), data.get("stone_type"))
-    text = (
-        f"✅ *Проверь данные:*\n\n"
-        f"Тип: {type_name} ({data.get('origin', '—')})\n"
-        f"Форма: {data.get('shape', '—')}\n"
-        f"Вес: {data.get('carat', '—')} кар\n"
-        f"Цвет: {data.get('color', '—')}\n"
-        f"Чистота: {data.get('clarity', '—')}\n"
-        f"Цена: {_fmt_price_with_usd(data)}\n"
-        f"Поставщик: {name}"
-    )
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Внести в базу", callback_data="buy_confirm_yes")
-    kb.button(text="❌ Отмена", callback_data="back_menu")
-    kb.adjust(1)
-    await message.answer(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+    await _ask_photo_before_confirm(message, state)
 
 
 @dp.callback_query(BuyStone.supplier, F.data.startswith("supplier_"))
@@ -1582,7 +1564,7 @@ async def buy_step8_supplier_selected(callback: CallbackQuery, state: FSMContext
     res = supabase.table("counterparties").select("name").eq("id", supplier_id).execute()
     supplier_name = res.data[0]["name"] if res.data else "—"
     await state.update_data(supplier_id=supplier_id, supplier_name=supplier_name)
-    await buy_confirm(callback, state)
+    await _ask_photo_before_confirm(callback, state)
 
 
 # ============================================================
@@ -1599,12 +1581,12 @@ def _fmt_price_with_usd(data: dict) -> str:
         s += f" = {price_usd:,.0f} USD"
     return s
 
-async def buy_confirm(callback: CallbackQuery, state: FSMContext):
+async def _show_buy_confirm(target, state: FSMContext):
     data = await state.get_data()
-
     type_name = {"diamond": "Бриллиант", "emerald": "Изумруд",
                  "ruby": "Рубин", "spinel": "Шпинель"}.get(data.get("stone_type"), data.get("stone_type"))
-
+    photo_status = "✅ Есть" if data.get("photo_file_id") else "—"
+    cert_status = "✅ Есть" if data.get("cert_file_id") else "—"
     text = (
         f"✅ *Проверь данные:*\n\n"
         f"Тип: {type_name} ({data.get('origin', '—')})\n"
@@ -1613,15 +1595,19 @@ async def buy_confirm(callback: CallbackQuery, state: FSMContext):
         f"Цвет: {data.get('color', '—')}\n"
         f"Чистота: {data.get('clarity', '—')}\n"
         f"Цена: {_fmt_price_with_usd(data)}\n"
-        f"Поставщик: {data.get('supplier_name', '—')}"
+        f"Поставщик: {data.get('supplier_name', '—')}\n"
+        f"Фото: {photo_status}\n"
+        f"Сертификат: {cert_status}"
     )
-
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Внести в базу", callback_data="buy_confirm_yes")
     kb.button(text="❌ Отмена", callback_data="back_menu")
     kb.adjust(1)
     await state.set_state(BuyStone.confirm)
-    await callback.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+    else:
+        await target.answer(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 
 def _skip_kb():
@@ -1646,6 +1632,24 @@ async def _ask_certificate(target):
         await target.message.edit_text(text, reply_markup=_skip_kb(), parse_mode="Markdown")
     else:
         await target.answer(text, reply_markup=_skip_kb(), parse_mode="Markdown")
+
+
+async def _ask_photo_before_confirm(target, state: FSMContext):
+    await state.set_state(BuyStone.photo)
+    text = "📸 Загрузи фото камня (или нажми Пропустить):"
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=_skip_kb())
+    else:
+        await target.answer(text, reply_markup=_skip_kb())
+
+
+async def _ask_cert_before_confirm(target, state: FSMContext):
+    await state.set_state(BuyStone.certificate)
+    text = "📄 Есть сертификат? Загрузи фото или нажми Пропустить:"
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=_skip_kb())
+    else:
+        await target.answer(text, reply_markup=_skip_kb())
 
 
 async def _finish(target, state: FSMContext):
@@ -1704,10 +1708,27 @@ async def _insert_stone(callback: CallbackQuery, state: FSMContext, data: dict):
             "created_by": user_id,
         }).execute()
 
-        await state.update_data(inserted_stone_id=stone_id, inserted_stone_code=stone_code,
-                                inserted_price_usd=price_usd)
-        await state.set_state(BuyStone.photo)
-        await _ask_photo(callback, stone_code, price_usd)
+        if data.get("photo_file_id"):
+            supabase.table("media_files").insert({
+                "entity_type": "stone", "entity_id": stone_id,
+                "file_type": "photo", "file_url": data["photo_file_id"],
+            }).execute()
+
+        if data.get("cert_file_id"):
+            supabase.table("media_files").insert({
+                "entity_type": "stone", "entity_id": stone_id,
+                "file_type": "certificate_scan", "file_url": data["cert_file_id"],
+            }).execute()
+            supabase.table("certificates").insert({
+                "stone_id": stone_id, "laboratory": "pending", "cert_number": "pending",
+            }).execute()
+
+        await state.clear()
+        kb = InlineKeyboardBuilder()
+        kb.button(text="◀️ Меню", callback_data="back_menu")
+        await callback.message.edit_text(
+            f"✅ *Камень внесён!*\n\nКод: `{stone_code}`\nСтоимость: {price_usd:,.0f} USD",
+            reply_markup=kb.as_markup(), parse_mode="Markdown")
     except Exception as e:
         await callback.message.edit_text(f"❌ Ошибка: {e}")
 
@@ -1718,30 +1739,14 @@ async def _insert_stone(callback: CallbackQuery, state: FSMContext, data: dict):
 
 @dp.message(BuyStone.photo, F.photo)
 async def buy_photo_received(message: Message, state: FSMContext):
-    data = await state.get_data()
-    stone_id = data.get("inserted_stone_id")
-    if not stone_id:
-        await message.answer("❌ Ошибка: ID камня не найден в сессии. Попробуй заново.")
-        return
-    file_id = message.photo[-1].file_id
-    try:
-        supabase.table("media_files").insert({
-            "entity_type": "stone",
-            "entity_id": stone_id,
-            "file_type": "photo",
-            "file_url": file_id,
-        }).execute()
-    except Exception as e:
-        await message.answer(f"⚠️ Фото не сохранилось: {e}\n\nПродолжаем...")
-    await state.set_state(BuyStone.certificate)
-    await _ask_certificate(message)
+    await state.update_data(photo_file_id=message.photo[-1].file_id)
+    await _ask_cert_before_confirm(message, state)
 
 
 @dp.callback_query(BuyStone.photo, F.data == "skip_media")
 async def buy_photo_skip(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    await state.set_state(BuyStone.certificate)
-    await _ask_certificate(callback)
+    await _ask_cert_before_confirm(callback, state)
 
 
 # ============================================================
@@ -1750,36 +1755,14 @@ async def buy_photo_skip(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(BuyStone.certificate, F.photo)
 async def buy_cert_received(message: Message, state: FSMContext):
-    data = await state.get_data()
-    stone_id = data.get("inserted_stone_id")
-    if not stone_id:
-        await message.answer("❌ Ошибка: ID камня не найден в сессии.")
-        return
-    file_id = message.photo[-1].file_id
-    try:
-        supabase.table("media_files").insert({
-            "entity_type": "stone",
-            "entity_id": stone_id,
-            "file_type": "certificate_scan",
-            "file_url": file_id,
-        }).execute()
-    except Exception as e:
-        await message.answer(f"⚠️ Скан не сохранился: {e}\n\nПродолжаем...")
-    try:
-        supabase.table("certificates").insert({
-            "stone_id": stone_id,
-            "laboratory": "pending",
-            "cert_number": "pending",
-        }).execute()
-    except Exception as e:
-        await message.answer(f"⚠️ Запись сертификата не создана: {e}\n\nПродолжаем...")
-    await _finish(message, state)
+    await state.update_data(cert_file_id=message.photo[-1].file_id)
+    await _show_buy_confirm(message, state)
 
 
 @dp.callback_query(BuyStone.certificate, F.data == "skip_media")
 async def buy_cert_skip(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    await _finish(callback, state)
+    await _show_buy_confirm(callback, state)
 
 
 @dp.callback_query(BuyStone.confirm, F.data == "buy_confirm_yes")
