@@ -75,6 +75,8 @@ class SupabaseFSMStorage(BaseStorage):
 
 
 bot = Bot(token=BOT_TOKEN)
+_bot_id = int(BOT_TOKEN.split(":")[0])
+_media_group_buffer: dict[str, dict] = {}
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 storage = SupabaseFSMStorage(supabase)
 dp = Dispatcher(storage=storage)
@@ -1585,7 +1587,17 @@ async def _show_buy_confirm(target, state: FSMContext):
     data = await state.get_data()
     type_name = {"diamond": "Бриллиант", "emerald": "Изумруд",
                  "ruby": "Рубин", "spinel": "Шпинель"}.get(data.get("stone_type"), data.get("stone_type"))
-    photo_status = "✅ Есть" if data.get("photo_file_id") else "—"
+    media = data.get("media") or []
+    if media:
+        n_photo = sum(1 for m in media if m["type"] == "photo")
+        n_video = sum(1 for m in media if m["type"] == "video")
+        n_anim  = sum(1 for m in media if m["type"] == "animation")
+        parts = ([f"{n_photo} фото"] if n_photo else []) + \
+                ([f"{n_video} видео"] if n_video else []) + \
+                ([f"{n_anim} GIF"] if n_anim else [])
+        media_status = f"✅ {len(media)} шт ({', '.join(parts)})"
+    else:
+        media_status = "—"
     cert_status = "✅ Есть" if data.get("cert_file_id") else "—"
     text = (
         f"✅ *Проверь данные:*\n\n"
@@ -1596,7 +1608,7 @@ async def _show_buy_confirm(target, state: FSMContext):
         f"Чистота: {data.get('clarity', '—')}\n"
         f"Цена: {_fmt_price_with_usd(data)}\n"
         f"Поставщик: {data.get('supplier_name', '—')}\n"
-        f"Фото: {photo_status}\n"
+        f"Медиа: {media_status}\n"
         f"Сертификат: {cert_status}"
     )
     kb = InlineKeyboardBuilder()
@@ -1635,12 +1647,15 @@ async def _ask_certificate(target):
 
 
 async def _ask_photo_before_confirm(target, state: FSMContext):
+    await state.update_data(media=[])
     await state.set_state(BuyStone.photo)
-    text = "📸 Загрузи фото камня (или нажми Пропустить):"
+    text = "📸 Загрузи фото/видео камня (до 4 штук)\nМожно отправить пачкой или по одному:"
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⏭ Пропустить", callback_data="skip_media")
     if isinstance(target, CallbackQuery):
-        await target.message.edit_text(text, reply_markup=_skip_kb())
+        await target.message.edit_text(text, reply_markup=kb.as_markup())
     else:
-        await target.answer(text, reply_markup=_skip_kb())
+        await target.answer(text, reply_markup=kb.as_markup())
 
 
 async def _ask_cert_before_confirm(target, state: FSMContext):
@@ -1708,10 +1723,10 @@ async def _insert_stone(callback: CallbackQuery, state: FSMContext, data: dict):
             "created_by": user_id,
         }).execute()
 
-        if data.get("photo_file_id"):
+        for m in (data.get("media") or []):
             supabase.table("media_files").insert({
                 "entity_type": "stone", "entity_id": stone_id,
-                "file_type": "photo", "file_url": data["photo_file_id"],
+                "file_type": m["type"], "file_url": m["file_id"],
             }).execute()
 
         if data.get("cert_file_id"):
@@ -1734,18 +1749,94 @@ async def _insert_stone(callback: CallbackQuery, state: FSMContext, data: dict):
 
 
 # ============================================================
-# КУПИЛИ — фото камня
+# КУПИЛИ — фото камня (медиа-группы до 4 файлов)
 # ============================================================
 
-@dp.message(BuyStone.photo, F.photo)
-async def buy_photo_received(message: Message, state: FSMContext):
-    await state.update_data(photo_file_id=message.photo[-1].file_id)
-    await _ask_cert_before_confirm(message, state)
+async def _flush_media_group(gid: str, chat_id: int, user_id: int) -> None:
+    try:
+        await asyncio.sleep(1.0)
+    except asyncio.CancelledError:
+        return
+    buf = _media_group_buffer.pop(gid, None)
+    if not buf:
+        return
+    key = StorageKey(bot_id=_bot_id, chat_id=chat_id, user_id=user_id, destiny="fsm")
+    ctx = FSMContext(storage=storage, key=key)
+    if await ctx.get_state() != BuyStone.photo.state:
+        return
+    data = await ctx.get_data()
+    media: list = list(data.get("media") or [])
+    for item in buf["items"]:
+        if len(media) >= 4:
+            break
+        media.append(item)
+    await ctx.update_data(media=media)
+    n = len(media)
+    if n >= 4:
+        await ctx.set_state(BuyStone.certificate)
+        await bot.send_message(
+            chat_id, "📄 Есть сертификат? Загрузи фото или нажми Пропустить:",
+            reply_markup=_skip_kb())
+        return
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Готово", callback_data="media_done")
+    kb.button(text="⏭ Пропустить", callback_data="skip_media")
+    kb.adjust(2)
+    await bot.send_message(
+        chat_id,
+        f"📸 *Добавлено медиа: {n} из 4*\n\nМожно добавить ещё или нажать Готово:",
+        reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
+@dp.message(BuyStone.photo, F.photo | F.video | F.animation)
+async def buy_media_received(message: Message, state: FSMContext):
+    if message.animation:
+        file_id, media_type = message.animation.file_id, "animation"
+    elif message.video:
+        file_id, media_type = message.video.file_id, "video"
+    else:
+        file_id, media_type = message.photo[-1].file_id, "photo"
+    item = {"type": media_type, "file_id": file_id}
+
+    if message.media_group_id and not message.animation:
+        gid = message.media_group_id
+        if gid not in _media_group_buffer:
+            _media_group_buffer[gid] = {"items": [], "task": None}
+        buf = _media_group_buffer[gid]
+        buf["items"].append(item)
+        if buf["task"] and not buf["task"].done():
+            buf["task"].cancel()
+        buf["task"] = asyncio.create_task(
+            _flush_media_group(gid, message.chat.id, message.from_user.id))
+    else:
+        data = await state.get_data()
+        media: list = list(data.get("media") or [])
+        if len(media) < 4:
+            media.append(item)
+        await state.update_data(media=media)
+        n = len(media)
+        if n >= 4:
+            await _ask_cert_before_confirm(message, state)
+            return
+        kb = InlineKeyboardBuilder()
+        kb.button(text="✅ Готово", callback_data="media_done")
+        kb.button(text="⏭ Пропустить", callback_data="skip_media")
+        kb.adjust(2)
+        await message.answer(
+            f"📸 *Добавлено медиа: {n} из 4*\n\nМожно добавить ещё или нажать Готово:",
+            reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
+@dp.callback_query(BuyStone.photo, F.data == "media_done")
+async def buy_media_done(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await _ask_cert_before_confirm(callback, state)
 
 
 @dp.callback_query(BuyStone.photo, F.data == "skip_media")
 async def buy_photo_skip(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
+    await state.update_data(media=[])
     await _ask_cert_before_confirm(callback, state)
 
 
