@@ -29,3 +29,4 @@ Python, aiogram, Supabase (PostgreSQL), Railway, Anthropic API (claude-sonnet-4-
 - 3226dc8 — единый поток внесения, карточка подтверждения, фото+сертификат опционально
 - 837276e — мультимедиа до 4 (фото/видео/gif), debounce-сборщик групп
 - aaa811d — fix: убрать debounce, asyncio.Lock на user_id, каждый файл сразу
+- fcf7c4d — fix UX: одно редактируемое сообщение-счётчик медиа вместо спама
