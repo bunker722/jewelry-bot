@@ -2314,8 +2314,8 @@ async def back_menu(callback: CallbackQuery, state: FSMContext):
 # КАРТОЧКА КАМНЯ — хелпер + кнопочный флоу + /stone
 # ============================================================
 
-async def _send_stone_card(msg: Message, s: dict, edit: bool = False):
-    """Показывает карточку камня + медиа. edit=True — редактирует msg, иначе отвечает новым."""
+async def _send_stone_card(msg: Message, s: dict):
+    """Порядок: медиа альбом → сертификат → текст карточки с кнопкой."""
     supplier_name = "—"
     if s.get("supplier_id"):
         sp = supabase.table("counterparties").select("name").eq("id", s["supplier_id"]).execute()
@@ -2333,6 +2333,14 @@ async def _send_stone_card(msg: Message, s: dict, edit: bool = False):
     clarity = s.get("clarity") or ""
     color_clarity = " · ".join(filter(None, [color, clarity]))
 
+    currency = s.get("purchase_currency") or "USD"
+    price = s.get("purchase_price", 0) or 0
+    price_usd = s.get("purchase_price_usd", 0) or 0
+    if currency == "USD":
+        price_line = f"Цена: {price:,.0f} USD"
+    else:
+        price_line = f"Цена: {price:,.0f} {currency} ({price_usd:,.0f} USD)"
+
     lines = [
         f"💎 *{abbr_type(s['stone_type'])}* {s['carat']}кар · `{abbr_code(s['stone_code'])}`",
         f"Форма: {s.get('shape') or '—'}",
@@ -2343,8 +2351,7 @@ async def _send_stone_card(msg: Message, s: dict, edit: bool = False):
         f"Статус: {get_status_emoji(s['status'])} {get_status_name(s['status'])}",
         "",
         f"Поставщик: {supplier_name}",
-        f"Цена: {s.get('purchase_price', 0):,.0f} {s.get('purchase_currency', '')} "
-        f"({s.get('purchase_price_usd', 0):,.0f} USD)",
+        price_line,
         "",
         f"Внёс: {creator_name} · {creator_date}",
     ]
@@ -2369,14 +2376,6 @@ async def _send_stone_card(msg: Message, s: dict, edit: bool = False):
                     client_name = cl.data[0]["name"]
             lines.append(f"Продал: {seller_name} · {sale_date} → {client_name}")
 
-    kb = InlineKeyboardBuilder()
-    kb.button(text="◀️ Меню", callback_data="back_menu")
-    text = "\n".join(lines)
-    if edit:
-        await msg.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
-    else:
-        await msg.answer(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
-
     media_rows = supabase.table("media_files") \
         .select("file_type,file_url") \
         .eq("entity_type", "stone").eq("entity_id", s["id"]) \
@@ -2385,6 +2384,7 @@ async def _send_stone_card(msg: Message, s: dict, edit: bool = False):
     visuals = [r for r in media_rows if r["file_type"] in ("photo", "video", "animation")]
     cert = next((r for r in media_rows if r["file_type"] == "certificate_scan"), None)
 
+    # Сначала медиа, потом карточка с кнопкой
     if visuals:
         media_group = []
         for r in visuals[:10]:
@@ -2399,6 +2399,10 @@ async def _send_stone_card(msg: Message, s: dict, edit: bool = False):
 
     if cert:
         await msg.answer_photo(cert["file_url"], caption="📜 Сертификат")
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="◀️ Меню", callback_data="back_menu")
+    await msg.answer("\n".join(lines), reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 
 @dp.callback_query(F.data == "action_view")
@@ -2437,7 +2441,13 @@ async def view_step2_card(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text("❌ Камень не найден.")
         return
 
-    await _send_stone_card(callback.message, res.data[0], edit=True)
+    # Удаляем список камней, чтобы медиа шло первым чистым блоком
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+    await _send_stone_card(callback.message, res.data[0])
 
 
 @dp.message(Command("stone"))
