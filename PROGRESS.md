@@ -32,3 +32,4 @@ Python, aiogram, Supabase (PostgreSQL), Railway, Anthropic API (claude-sonnet-4-
 - aaa811d — fix: убрать debounce, asyncio.Lock на user_id, каждый файл сразу
 - fcf7c4d — fix UX: одно редактируемое сообщение-счётчик медиа вместо спама
 - 14227a1 — просмотр фото камней, обработка камня без фото
+- 3083355 — бейдж 📷N в начале кнопки списка (один запрос на все камни, фильтр в Python)
