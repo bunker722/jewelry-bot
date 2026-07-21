@@ -2423,16 +2423,19 @@ async def view_step1(callback: CallbackQuery, state: FSMContext):
         return
 
     stone_ids = [s["id"] for s in data.data]
-    media_rows = supabase.table("media_files") \
-        .select("entity_id") \
-        .eq("entity_type", "stone") \
-        .in_("entity_id", stone_ids) \
-        .in_("file_type", ["photo", "video", "animation"]) \
-        .execute().data or []
     media_counts: dict = {}
-    for r in media_rows:
-        eid = r["entity_id"]
-        media_counts[eid] = media_counts.get(eid, 0) + 1
+    try:
+        media_rows = supabase.table("media_files") \
+            .select("entity_id,file_type") \
+            .eq("entity_type", "stone") \
+            .in_("entity_id", stone_ids) \
+            .execute().data or []
+        for r in media_rows:
+            if r["file_type"] in ("photo", "video", "animation"):
+                eid = r["entity_id"]
+                media_counts[eid] = media_counts.get(eid, 0) + 1
+    except Exception:
+        pass  # если запрос упал — показываем список без значков
 
     kb = InlineKeyboardBuilder()
     for s in data.data:
