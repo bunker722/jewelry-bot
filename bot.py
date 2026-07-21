@@ -2384,6 +2384,9 @@ async def _send_stone_card(msg: Message, s: dict):
     visuals = [r for r in media_rows if r["file_type"] in ("photo", "video", "animation")]
     cert = next((r for r in media_rows if r["file_type"] == "certificate_scan"), None)
 
+    if not visuals and not cert:
+        lines += ["", "📷 Нет загруженных фото"]
+
     # Сначала медиа, потом карточка с кнопкой
     if visuals:
         media_group = []
