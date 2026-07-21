@@ -2409,17 +2409,34 @@ async def _send_stone_card(msg: Message, s: dict):
 
 
 @dp.callback_query(F.data == "action_view")
-async def view_step1(callback: CallbackQuery, state: FSMContext):
+async def view_filter_select(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer()
-    data = supabase.table("stones").select("id,stone_code,stone_type,carat") \
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🌿 Природные",  callback_data="view_filter_natural")
+    kb.button(text="⚗️ Синтетика", callback_data="view_filter_synthetic")
+    kb.button(text="📋 Все",        callback_data="view_filter_all")
+    kb.button(text="◀️ Меню",       callback_data="back_menu")
+    kb.adjust(2, 1, 1)
+    await callback.message.edit_text("👁 *Какие камни показать?*",
+                                     reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
+async def _view_show_list(callback: CallbackQuery, filter_type: str):
+    q = supabase.table("stones").select("id,stone_code,stone_type,carat") \
         .not_.in_("status", ["sold", "written_off"]) \
-        .order("created_at", desc=True).execute()
+        .order("created_at", desc=True)
+    if filter_type == "natural":
+        q = q.ilike("stone_type", "%(Природный)%")
+    elif filter_type == "synthetic":
+        q = q.ilike("stone_type", "%(Синтетический)%")
+    data = q.execute()
 
     if not data.data:
         kb = InlineKeyboardBuilder()
-        kb.button(text="◀️ Меню", callback_data="back_menu")
-        await callback.message.edit_text("Нет камней для просмотра.", reply_markup=kb.as_markup())
+        kb.button(text="◀️ Назад", callback_data="action_view")
+        await callback.message.edit_text("Нет камней по этому фильтру.",
+                                         reply_markup=kb.as_markup())
         return
 
     stone_ids = [s["id"] for s in data.data]
@@ -2435,17 +2452,26 @@ async def view_step1(callback: CallbackQuery, state: FSMContext):
                 eid = r["entity_id"]
                 media_counts[eid] = media_counts.get(eid, 0) + 1
     except Exception:
-        pass  # если запрос упал — показываем список без значков
+        pass
 
     kb = InlineKeyboardBuilder()
     for s in data.data:
         count = media_counts.get(s["id"], 0)
         badge = f"📷{count}" if count else "📷—"
         kb.button(text=f"{badge} · {fmt_stone_btn(s)}", callback_data=f"view_stone_{s['id']}")
-    kb.button(text="◀️ Назад", callback_data="back_menu")
+    kb.button(text="◀️ Назад", callback_data="action_view")
     kb.adjust(1)
-    await callback.message.edit_text("👁 *Выбери камень:*",
+
+    titles = {"natural": "🌿 Природные", "synthetic": "⚗️ Синтетика", "all": "📋 Все"}
+    await callback.message.edit_text(f"👁 *{titles[filter_type]}* — выбери камень:",
                                      reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
+@dp.callback_query(F.data.startswith("view_filter_"))
+async def view_filter_applied(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    filter_type = callback.data.replace("view_filter_", "")
+    await _view_show_list(callback, filter_type)
 
 
 @dp.callback_query(F.data.startswith("view_stone_"))
