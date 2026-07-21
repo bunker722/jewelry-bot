@@ -2422,9 +2422,23 @@ async def view_step1(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text("Нет камней для просмотра.", reply_markup=kb.as_markup())
         return
 
+    stone_ids = [s["id"] for s in data.data]
+    media_rows = supabase.table("media_files") \
+        .select("entity_id") \
+        .eq("entity_type", "stone") \
+        .in_("entity_id", stone_ids) \
+        .in_("file_type", ["photo", "video", "animation"]) \
+        .execute().data or []
+    media_counts: dict = {}
+    for r in media_rows:
+        eid = r["entity_id"]
+        media_counts[eid] = media_counts.get(eid, 0) + 1
+
     kb = InlineKeyboardBuilder()
     for s in data.data:
-        kb.button(text=fmt_stone_btn(s), callback_data=f"view_stone_{s['id']}")
+        count = media_counts.get(s["id"], 0)
+        badge = f"📷{count}" if count else "📷—"
+        kb.button(text=f"{fmt_stone_btn(s)}  {badge}", callback_data=f"view_stone_{s['id']}")
     kb.button(text="◀️ Назад", callback_data="back_menu")
     kb.adjust(1)
     await callback.message.edit_text("👁 *Выбери камень:*",
