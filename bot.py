@@ -5,7 +5,7 @@ import httpx
 import os
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
-from aiogram.types import Message, CallbackQuery, TelegramObject
+from aiogram.types import Message, CallbackQuery, TelegramObject, InputMediaPhoto, InputMediaVideo, InputMediaAnimation
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -331,7 +331,8 @@ def main_keyboard():
     kb.button(text="📋 Склад", callback_data="action_inventory")
     kb.button(text="💵 Итого", callback_data="action_total")
     kb.button(text="📊 Экспорт", callback_data="action_export")
-    kb.adjust(2, 2, 2, 1)
+    kb.button(text="👁 Посмотреть", callback_data="action_view")
+    kb.adjust(2, 2, 2, 2)
     return kb.as_markup()
 
 
@@ -2310,29 +2311,11 @@ async def back_menu(callback: CallbackQuery, state: FSMContext):
 
 
 # ============================================================
-# КАРТОЧКА КАМНЯ
+# КАРТОЧКА КАМНЯ — хелпер + кнопочный флоу + /stone
 # ============================================================
 
-@dp.message(Command("stone"))
-async def cmd_stone(message: Message, state: FSMContext):
-    await state.clear()
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("Использование: /stone <код>\n\nПример: /stone ST-2026-001")
-        return
-
-    code = args[1].strip().upper()
-    res = supabase.table("stones").select(
-        "id,stone_code,stone_type,shape,carat,color,clarity,status,"
-        "purchase_price,purchase_currency,purchase_price_usd,created_at,created_by,supplier_id"
-    ).ilike("stone_code", code).execute()
-
-    if not res.data:
-        await message.answer(f"❌ Камень `{code}` не найден.", parse_mode="Markdown")
-        return
-
-    s = res.data[0]
-
+async def _send_stone_card(msg: Message, s: dict, edit: bool = False):
+    """Показывает карточку камня + медиа. edit=True — редактирует msg, иначе отвечает новым."""
     supplier_name = "—"
     if s.get("supplier_id"):
         sp = supabase.table("counterparties").select("name").eq("id", s["supplier_id"]).execute()
@@ -2358,11 +2341,11 @@ async def cmd_stone(message: Message, state: FSMContext):
         lines.append(f"Цвет/Чистота: {color_clarity}")
     lines += [
         f"Статус: {get_status_emoji(s['status'])} {get_status_name(s['status'])}",
-        f"",
+        "",
         f"Поставщик: {supplier_name}",
         f"Цена: {s.get('purchase_price', 0):,.0f} {s.get('purchase_currency', '')} "
         f"({s.get('purchase_price_usd', 0):,.0f} USD)",
-        f"",
+        "",
         f"Внёс: {creator_name} · {creator_date}",
     ]
 
@@ -2371,7 +2354,6 @@ async def cmd_stone(message: Message, state: FSMContext):
             "created_by,created_at,counterparty_id"
         ).eq("entity_id", s["id"]).eq("operation_type", "sale_stone") \
          .order("created_at", desc=True).limit(1).execute()
-
         if sale.data:
             op = sale.data[0]
             seller_name = "—"
@@ -2389,7 +2371,94 @@ async def cmd_stone(message: Message, state: FSMContext):
 
     kb = InlineKeyboardBuilder()
     kb.button(text="◀️ Меню", callback_data="back_menu")
-    await message.answer("\n".join(lines), reply_markup=kb.as_markup(), parse_mode="Markdown")
+    text = "\n".join(lines)
+    if edit:
+        await msg.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+    else:
+        await msg.answer(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+    media_rows = supabase.table("media_files") \
+        .select("file_type,file_url") \
+        .eq("entity_type", "stone").eq("entity_id", s["id"]) \
+        .execute().data or []
+
+    visuals = [r for r in media_rows if r["file_type"] in ("photo", "video", "animation")]
+    cert = next((r for r in media_rows if r["file_type"] == "certificate_scan"), None)
+
+    if visuals:
+        media_group = []
+        for r in visuals[:10]:
+            ft, fid = r["file_type"], r["file_url"]
+            if ft == "photo":
+                media_group.append(InputMediaPhoto(media=fid))
+            elif ft == "video":
+                media_group.append(InputMediaVideo(media=fid))
+            else:
+                media_group.append(InputMediaAnimation(media=fid))
+        await msg.answer_media_group(media_group)
+
+    if cert:
+        await msg.answer_photo(cert["file_url"], caption="📜 Сертификат")
+
+
+@dp.callback_query(F.data == "action_view")
+async def view_step1(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer()
+    data = supabase.table("stones").select("id,stone_code,stone_type,carat") \
+        .not_.in_("status", ["sold", "written_off"]) \
+        .order("created_at", desc=True).execute()
+
+    if not data.data:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="◀️ Меню", callback_data="back_menu")
+        await callback.message.edit_text("Нет камней для просмотра.", reply_markup=kb.as_markup())
+        return
+
+    kb = InlineKeyboardBuilder()
+    for s in data.data:
+        kb.button(text=fmt_stone_btn(s), callback_data=f"view_stone_{s['id']}")
+    kb.button(text="◀️ Назад", callback_data="back_menu")
+    kb.adjust(1)
+    await callback.message.edit_text("👁 *Выбери камень:*",
+                                     reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
+@dp.callback_query(F.data.startswith("view_stone_"))
+async def view_step2_card(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    stone_id = callback.data.replace("view_stone_", "")
+    res = supabase.table("stones").select(
+        "id,stone_code,stone_type,shape,carat,color,clarity,status,"
+        "purchase_price,purchase_currency,purchase_price_usd,created_at,created_by,supplier_id"
+    ).eq("id", stone_id).execute()
+
+    if not res.data:
+        await callback.message.edit_text("❌ Камень не найден.")
+        return
+
+    await _send_stone_card(callback.message, res.data[0], edit=True)
+
+
+@dp.message(Command("stone"))
+async def cmd_stone(message: Message, state: FSMContext):
+    await state.clear()
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("Использование: /stone <код>\n\nПример: /stone ST-2026-001")
+        return
+
+    code = args[1].strip().upper()
+    res = supabase.table("stones").select(
+        "id,stone_code,stone_type,shape,carat,color,clarity,status,"
+        "purchase_price,purchase_currency,purchase_price_usd,created_at,created_by,supplier_id"
+    ).ilike("stone_code", code).execute()
+
+    if not res.data:
+        await message.answer(f"❌ Камень `{code}` не найден.", parse_mode="Markdown")
+        return
+
+    await _send_stone_card(message, res.data[0])
 
 
 # ============================================================
