@@ -2441,7 +2441,7 @@ async def view_step1(callback: CallbackQuery, state: FSMContext):
     for s in data.data:
         count = media_counts.get(s["id"], 0)
         badge = f"📷{count}" if count else "📷—"
-        kb.button(text=f"{fmt_stone_btn(s)}  {badge}", callback_data=f"view_stone_{s['id']}")
+        kb.button(text=f"{badge} · {fmt_stone_btn(s)}", callback_data=f"view_stone_{s['id']}")
     kb.button(text="◀️ Назад", callback_data="back_menu")
     kb.adjust(1)
     await callback.message.edit_text("👁 *Выбери камень:*",
