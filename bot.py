@@ -2419,21 +2419,39 @@ def _holder_kb(prefix: str, back_cb: str):
 
 
 @dp.callback_query(F.data == "action_relocate")
-async def relocate_step1(callback: CallbackQuery, state: FSMContext):
+async def relocate_filter_select(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    data = supabase.table("stones").select("id,stone_code,stone_type,carat") \
-        .not_.in_("status", ["sold", "written_off"]).order("created_at", desc=True).execute()
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🌿 Природные",  callback_data="rl_filter_natural")
+    kb.button(text="⚗️ Синтетика", callback_data="rl_filter_synthetic")
+    kb.button(text="📋 Все",        callback_data="rl_filter_all")
+    kb.button(text="◀️ Меню",       callback_data="back_menu")
+    kb.adjust(2, 1, 1)
+    await callback.message.edit_text("📍 *Какие камни показать?*",
+                                     reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
+@dp.callback_query(F.data.startswith("rl_filter_"))
+async def relocate_step1(callback: CallbackQuery, state: FSMContext):
+    filter_type = callback.data.replace("rl_filter_", "")
+    q = supabase.table("stones").select("id,stone_code,stone_type,carat") \
+        .not_.in_("status", ["sold", "written_off"])
+    if filter_type == "natural":
+        q = q.ilike("stone_type", "%(Природный)%")
+    elif filter_type == "synthetic":
+        q = q.ilike("stone_type", "%(Синтетический)%")
+    data = q.order("created_at", desc=True).execute()
 
     if not data.data:
         kb = InlineKeyboardBuilder()
-        kb.button(text="◀️ Меню", callback_data="back_menu")
-        await callback.message.edit_text("Нет камней для перемещения.", reply_markup=kb.as_markup())
+        kb.button(text="◀️ Назад", callback_data="action_relocate")
+        await callback.message.edit_text("Нет камней по этому фильтру.", reply_markup=kb.as_markup())
         return
 
     kb = InlineKeyboardBuilder()
     for s in data.data:
         kb.button(text=fmt_stone_btn(s), callback_data=f"rl_stone_{s['id']}")
-    kb.button(text="◀️ Назад", callback_data="back_menu")
+    kb.button(text="◀️ Назад", callback_data="action_relocate")
     kb.adjust(1)
     await state.set_state(RelocateStone.select_stone)
     await callback.message.edit_text("📍 *Какой камень перемещаем?*",
@@ -2981,16 +2999,22 @@ async def view_filter_place_menu(callback: CallbackQuery, state: FSMContext):
         .not_.in_("status", ["sold", "written_off"]).execute().data or []
 
     loc_ids = list({s["location_id"] for s in stones if s.get("location_id")})
+    has_unset = any(not s.get("location_id") for s in stones)
 
     kb = InlineKeyboardBuilder()
-    if not loc_ids:
+    if not loc_ids and not has_unset:
         kb.button(text="◀️ Назад", callback_data="action_view")
         await callback.message.edit_text("Нет камней с проставленным местоположением.",
                                          reply_markup=kb.as_markup())
         return
 
-    locs = supabase.table("locations").select("id,name,counterparty_id,user_id") \
-        .in_("id", loc_ids).order("name").execute().data or []
+    if has_unset:
+        kb.button(text="📍 Место не указано", callback_data="vf_loc_none")
+
+    locs = []
+    if loc_ids:
+        locs = supabase.table("locations").select("id,name,counterparty_id,user_id") \
+            .in_("id", loc_ids).order("name").execute().data or []
     for l in locs:
         is_person = bool(l.get("counterparty_id") or l.get("user_id"))
         icon = "👤" if is_person else "🏠"
@@ -3011,9 +3035,11 @@ async def _view_show_list(callback: CallbackQuery, filter_type: str, filter_valu
         q = q.ilike("stone_type", "%(Синтетический)%")
     elif filter_type == "loc":
         q = q.eq("location_id", filter_value)
+    elif filter_type == "loc_none":
+        q = q.is_("location_id", None)
     data = q.execute()
 
-    back_cb = "view_filter_place" if filter_type == "loc" else "action_view"
+    back_cb = "view_filter_place" if filter_type in ("loc", "loc_none") else "action_view"
 
     if not data.data:
         kb = InlineKeyboardBuilder()
@@ -3047,6 +3073,8 @@ async def _view_show_list(callback: CallbackQuery, filter_type: str, filter_valu
 
     if filter_type in ("natural", "synthetic", "all"):
         title = {"natural": "🌿 Природные", "synthetic": "⚗️ Синтетика", "all": "📋 Все"}[filter_type]
+    elif filter_type == "loc_none":
+        title = "📍 Место не указано"
     else:
         prefix, name = resolve_location_display(filter_value)
         title = f"📍 {prefix}{name}"
@@ -3059,6 +3087,12 @@ async def view_filter_applied(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     filter_type = callback.data.replace("view_filter_", "")
     await _view_show_list(callback, filter_type)
+
+
+@dp.callback_query(F.data == "vf_loc_none")
+async def view_filter_by_no_location(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await _view_show_list(callback, "loc_none")
 
 
 @dp.callback_query(F.data.startswith("vf_loc_"))
