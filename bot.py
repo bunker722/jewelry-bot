@@ -1159,12 +1159,36 @@ async def export_stones(callback: CallbackQuery):
 
 
 # ============================================================
+# КУПИЛИ — навигация "Назад": стек пройденных шагов в FSM-данных.
+# Каждый forward-переход пушит ключ ТЕКУЩЕГО экрана перед показом следующего;
+# "Назад" снимает верхний ключ со стека и заново рендерит этот экран —
+# данные никогда не сбрасываются (state.clear() только в начале/конце флоу).
+# ============================================================
+
+async def _nav_push(state: FSMContext, step: str):
+    data = await state.get_data()
+    stack = list(data.get("_nav", []))
+    stack.append(step)
+    await state.update_data(_nav=stack)
+
+async def _nav_pop(state: FSMContext):
+    data = await state.get_data()
+    stack = list(data.get("_nav", []))
+    if not stack:
+        return None
+    step = stack.pop()
+    await state.update_data(_nav=stack)
+    return step
+
+
+_TYPE_NAME_MAP = {"diamond": "Бриллиант", "emerald": "Изумруд", "ruby": "Рубин", "spinel": "Шпинель"}
+
+
+# ============================================================
 # КУПИЛИ — шаг 1: тип камня
 # ============================================================
 
-@dp.callback_query(F.data == "action_buy")
-async def buy_step1_type(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
+async def _show_stone_type(target, state: FSMContext):
     kb = InlineKeyboardBuilder()
     kb.button(text="💎 Бриллиант", callback_data="type_diamond")
     kb.button(text="💚 Изумруд", callback_data="type_emerald")
@@ -1174,32 +1198,46 @@ async def buy_step1_type(callback: CallbackQuery, state: FSMContext):
     kb.button(text="◀️ Назад", callback_data="back_menu")
     kb.adjust(2, 2, 1, 1)
     await state.set_state(BuyStone.stone_type)
-    await callback.message.edit_text("💎 *Тип камня?*",
-                                     reply_markup=kb.as_markup(), parse_mode="Markdown")
+    text = "💎 *Тип камня?*"
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+    else:
+        await target.answer(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
+@dp.callback_query(F.data == "action_buy")
+async def buy_step1_type(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await _show_stone_type(callback, state)
 
 
 # ============================================================
 # КУПИЛИ — шаг 2: происхождение
 # ============================================================
 
+async def _show_origin(target, state: FSMContext):
+    data = await state.get_data()
+    display = _TYPE_NAME_MAP.get(data.get("stone_type"), data.get("stone_type", ""))
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🌍 Природный", callback_data="origin_natural")
+    kb.button(text="🔬 Синтетический", callback_data="origin_synthetic")
+    kb.button(text="◀️ Назад", callback_data="buy_back")
+    kb.adjust(2, 1)
+    await state.set_state(BuyStone.origin)
+    text = f"*{display}*\n\n🌍 Происхождение?"
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+    else:
+        await target.answer(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
 @dp.callback_query(BuyStone.stone_type, F.data.in_({"type_diamond", "type_emerald", "type_ruby", "type_spinel"}))
 async def buy_step2_origin(callback: CallbackQuery, state: FSMContext):
     type_map = {"type_diamond": "diamond", "type_emerald": "emerald",
                 "type_ruby": "ruby", "type_spinel": "spinel"}
-    name_map = {"diamond": "Бриллиант", "emerald": "Изумруд",
-                "ruby": "Рубин", "spinel": "Шпинель"}
-    stone_type = type_map[callback.data]
-    await state.update_data(stone_type=stone_type)
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🌍 Природный", callback_data="origin_natural")
-    kb.button(text="🔬 Синтетический", callback_data="origin_synthetic")
-    kb.button(text="◀️ Назад", callback_data="action_buy")
-    kb.adjust(2, 1)
-    await state.set_state(BuyStone.origin)
-    await callback.message.edit_text(
-        f"*{name_map[stone_type]}*\n\n🌍 Происхождение?",
-        reply_markup=kb.as_markup(), parse_mode="Markdown")
+    await state.update_data(stone_type=type_map[callback.data])
+    await _nav_push(state, "stone_type")
+    await _show_origin(callback, state)
 
 
 # ============================================================
@@ -1209,27 +1247,26 @@ async def buy_step2_origin(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(BuyStone.stone_type, F.data == "type_custom")
 async def buy_step1_type_custom(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BuyStone.stone_type_custom)
-    await callback.message.edit_text("✏️ Введи название камня:")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="◀️ Назад", callback_data="buy_back_type")
+    await callback.message.edit_text("✏️ Введи название камня:", reply_markup=kb.as_markup())
 
 
 @dp.message(BuyStone.stone_type_custom)
 async def buy_step1_type_custom_text(message: Message, state: FSMContext):
     stone_type = message.text.strip()
     await state.update_data(stone_type=stone_type)
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🌍 Природный", callback_data="origin_natural")
-    kb.button(text="🔬 Синтетический", callback_data="origin_synthetic")
-    kb.button(text="◀️ Назад", callback_data="action_buy")
-    kb.adjust(2, 1)
-    await state.set_state(BuyStone.origin)
-    await message.answer(f"*{stone_type}*\n\n🌍 Происхождение?",
-                         reply_markup=kb.as_markup(), parse_mode="Markdown")
+    await _nav_push(state, "stone_type")
+    await _show_origin(message, state)
 
 
 @dp.callback_query(BuyStone.stone_type, F.data == "type_search")
 async def buy_step1_type_search(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BuyStone.stone_search)
-    await callback.message.edit_text("🔍 Напиши название камня или первые буквы:")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="◀️ Назад", callback_data="buy_back_type")
+    await callback.message.edit_text("🔍 Напиши название камня или первые буквы:",
+                                     reply_markup=kb.as_markup())
 
 
 @dp.message(BuyStone.stone_search)
@@ -1244,11 +1281,12 @@ async def buy_step1_search_query(message: Message, state: FSMContext):
         for stone in matches:
             kb.button(text=stone, callback_data=f"found_{stone}")
         kb.button(text="✏️ Ввести вручную", callback_data="manual_input")
+        kb.button(text="◀️ Назад", callback_data="buy_back_type")
         kb.adjust(2)
         await message.answer("🔍 Выбери камень:", reply_markup=kb.as_markup())
     else:
         kb.button(text="✏️ Ввести вручную", callback_data="manual_input")
-        kb.button(text="◀️ Назад", callback_data="action_buy")
+        kb.button(text="◀️ Назад", callback_data="buy_back_type")
         kb.adjust(1)
         await message.answer(
             "❌ Камень не найден. Попробуй другой запрос или введи название вручную:",
@@ -1260,90 +1298,91 @@ async def buy_step1_search_query(message: Message, state: FSMContext):
 async def buy_step1_found_selected(callback: CallbackQuery, state: FSMContext):
     stone_name = callback.data.replace("found_", "")
     await state.update_data(stone_type=stone_name)
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🌍 Природный", callback_data="origin_natural")
-    kb.button(text="🔬 Синтетический", callback_data="origin_synthetic")
-    kb.button(text="◀️ Назад", callback_data="action_buy")
-    kb.adjust(2, 1)
-    await state.set_state(BuyStone.origin)
-    await callback.message.edit_text(
-        f"*{stone_name}*\n\n🌍 Происхождение?",
-        reply_markup=kb.as_markup(), parse_mode="Markdown"
-    )
+    await _nav_push(state, "stone_type")
+    await _show_origin(callback, state)
 
 
 @dp.callback_query(BuyStone.stone_search, F.data == "manual_input")
 async def buy_step1_search_manual(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BuyStone.stone_type_custom)
-    await callback.message.edit_text("✏️ Введи название камня:")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="◀️ Назад", callback_data="buy_back_type")
+    await callback.message.edit_text("✏️ Введи название камня:", reply_markup=kb.as_markup())
+
+
+async def _show_shape(target, state: FSMContext):
+    kb = InlineKeyboardBuilder()
+    for shape in ["Round", "Oval", "Cushion", "Pear", "Princess", "Emerald cut", "Marquise"]:
+        kb.button(text=shape, callback_data=f"shape_{shape}")
+    kb.button(text="✏️ Другая", callback_data="shape_custom")
+    kb.button(text="◀️ Назад", callback_data="buy_back")
+    kb.adjust(3, 3, 1, 1)
+    await state.set_state(BuyStone.shape)
+    text = "💎 *Форма огранки?*"
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+    else:
+        await target.answer(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 
 @dp.callback_query(BuyStone.origin, F.data.startswith("origin_"))
 async def buy_step3_shape(callback: CallbackQuery, state: FSMContext):
     origin = "Природный" if callback.data == "origin_natural" else "Синтетический"
     await state.update_data(origin=origin)
-
-    kb = InlineKeyboardBuilder()
-    for shape in ["Round", "Oval", "Cushion", "Pear", "Princess", "Emerald cut", "Marquise"]:
-        kb.button(text=shape, callback_data=f"shape_{shape}")
-    kb.button(text="✏️ Другая", callback_data="shape_custom")
-    kb.button(text="◀️ Назад", callback_data="action_buy")
-    kb.adjust(3, 3, 1, 1)
-    await state.set_state(BuyStone.shape)
-    await callback.message.edit_text("💎 *Форма огранки?*",
-                                     reply_markup=kb.as_markup(), parse_mode="Markdown")
+    await _nav_push(state, "origin")
+    await _show_shape(callback, state)
 
 
 @dp.callback_query(BuyStone.shape, F.data == "shape_custom")
 async def buy_step3_shape_custom(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BuyStone.shape_custom)
-    await callback.message.edit_text("✏️ Напиши форму огранки:")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="◀️ Назад", callback_data="buy_back_shape")
+    await callback.message.edit_text("✏️ Напиши форму огранки:", reply_markup=kb.as_markup())
 
 
 @dp.message(BuyStone.shape_custom)
 async def buy_step3_shape_text(message: Message, state: FSMContext):
     await state.update_data(shape=message.text.strip())
-    await buy_step4_carat_msg(message, state)
+    await _nav_push(state, "shape")
+    await _show_carat(message, state)
 
 
 @dp.callback_query(BuyStone.shape, F.data.startswith("shape_"))
 async def buy_step3_shape_selected(callback: CallbackQuery, state: FSMContext):
     shape = callback.data.replace("shape_", "")
     await state.update_data(shape=shape)
-    await buy_step4_carat_cb(callback, state)
+    await _nav_push(state, "shape")
+    await _show_carat(callback, state)
 
 
 # ============================================================
 # КУПИЛИ — шаг 4: каратность
 # ============================================================
 
-async def buy_step4_carat_cb(callback: CallbackQuery, state: FSMContext):
+async def _show_carat(target, state: FSMContext):
     kb = InlineKeyboardBuilder()
     kb.button(text="0.1–0.9 кар", callback_data="carat_hint_small")
     kb.button(text="1–4 кар", callback_data="carat_hint_mid")
     kb.button(text="5+ кар", callback_data="carat_hint_large")
     kb.button(text="✏️ Ввести точно", callback_data="carat_custom")
-    kb.adjust(3, 1)
+    kb.button(text="◀️ Назад", callback_data="buy_back")
+    kb.adjust(3, 1, 1)
     await state.set_state(BuyStone.carat)
-    await callback.message.edit_text("⚖️ *Вес (каратов)?*",
-                                     reply_markup=kb.as_markup(), parse_mode="Markdown")
-
-async def buy_step4_carat_msg(message: Message, state: FSMContext):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="0.1–0.9 кар", callback_data="carat_hint_small")
-    kb.button(text="1–4 кар", callback_data="carat_hint_mid")
-    kb.button(text="5+ кар", callback_data="carat_hint_large")
-    kb.button(text="✏️ Ввести точно", callback_data="carat_custom")
-    kb.adjust(3, 1)
-    await state.set_state(BuyStone.carat)
-    await message.answer("⚖️ *Вес (каратов)?*",
-                        reply_markup=kb.as_markup(), parse_mode="Markdown")
+    text = "⚖️ *Вес (каратов)?*"
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+    else:
+        await target.answer(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 
 @dp.callback_query(BuyStone.carat, F.data.in_({"carat_custom", "carat_hint_small", "carat_hint_mid", "carat_hint_large"}))
 async def buy_step4_carat_custom(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BuyStone.carat_custom)
-    await callback.message.edit_text("✏️ Введи точный вес в каратах (например: 1.23):")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="◀️ Назад", callback_data="buy_back_carat")
+    await callback.message.edit_text("✏️ Введи точный вес в каратах (например: 1.23):",
+                                     reply_markup=kb.as_markup())
 
 
 @dp.message(BuyStone.carat_custom)
@@ -1351,145 +1390,124 @@ async def buy_step4_carat_text(message: Message, state: FSMContext):
     try:
         carat = float(message.text.strip().replace(",", "."))
         await state.update_data(carat=carat)
-        await buy_step5_color_msg(message, state)
+        await _nav_push(state, "carat")
+        await _show_color(message, state)
     except:
         await message.answer("❌ Введи число, например: 1.23")
-
 
 
 # ============================================================
 # КУПИЛИ — шаг 5: цвет
 # ============================================================
 
-async def buy_step5_color_cb(callback: CallbackQuery, state: FSMContext):
+async def _show_color(target, state: FSMContext):
     data = await state.get_data()
     stone_type = data.get("stone_type")
     kb = InlineKeyboardBuilder()
     if stone_type == "diamond":
         for c in ["D", "E", "F", "G", "H", "I", "J", "K"]:
             kb.button(text=c, callback_data=f"color_{c}")
-        kb.adjust(4)
     else:
         for c in ["AAA", "AA", "A", "B"]:
             kb.button(text=c, callback_data=f"color_{c}")
-        kb.adjust(4)
     kb.button(text="✏️ Другой", callback_data="color_custom")
+    kb.button(text="◀️ Назад", callback_data="buy_back")
+    kb.adjust(4, 1, 1)
     await state.set_state(BuyStone.color)
-    await callback.message.edit_text("🎨 *Цвет?*",
-                                     reply_markup=kb.as_markup(), parse_mode="Markdown")
-
-async def buy_step5_color_msg(message: Message, state: FSMContext):
-    data = await state.get_data()
-    stone_type = data.get("stone_type")
-    kb = InlineKeyboardBuilder()
-    if stone_type == "diamond":
-        for c in ["D", "E", "F", "G", "H", "I", "J", "K"]:
-            kb.button(text=c, callback_data=f"color_{c}")
-        kb.adjust(4)
+    text = "🎨 *Цвет?*"
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
     else:
-        for c in ["AAA", "AA", "A", "B"]:
-            kb.button(text=c, callback_data=f"color_{c}")
-        kb.adjust(4)
-    kb.button(text="✏️ Другой", callback_data="color_custom")
-    await state.set_state(BuyStone.color)
-    await message.answer("🎨 *Цвет?*", reply_markup=kb.as_markup(), parse_mode="Markdown")
+        await target.answer(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 
 @dp.callback_query(BuyStone.color, F.data == "color_custom")
 async def buy_step5_color_custom(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BuyStone.color)
     await state.update_data(waiting_color_text=True)
-    await callback.message.edit_text("✏️ Введи цвет:")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="◀️ Назад", callback_data="buy_back_color")
+    await callback.message.edit_text("✏️ Введи цвет:", reply_markup=kb.as_markup())
 
 
 @dp.callback_query(BuyStone.color, F.data.startswith("color_"))
 async def buy_step5_color_selected(callback: CallbackQuery, state: FSMContext):
     color = callback.data.replace("color_", "")
     await state.update_data(color=color)
-    await buy_step6_clarity_cb(callback, state)
+    await _nav_push(state, "color")
+    await _show_clarity(callback, state)
 
 
 @dp.message(BuyStone.color)
 async def buy_step5_color_text(message: Message, state: FSMContext):
     await state.update_data(color=message.text.strip())
-    await buy_step6_clarity_msg(message, state)
+    await _nav_push(state, "color")
+    await _show_clarity(message, state)
 
 
 # ============================================================
 # КУПИЛИ — шаг 6: чистота
 # ============================================================
 
-async def buy_step6_clarity_cb(callback: CallbackQuery, state: FSMContext):
+async def _show_clarity(target, state: FSMContext):
     data = await state.get_data()
     stone_type = data.get("stone_type")
     kb = InlineKeyboardBuilder()
     if stone_type == "diamond":
         for c in ["IF", "VVS1", "VVS2", "VS1", "VS2", "SI1", "SI2", "I1"]:
             kb.button(text=c, callback_data=f"clarity_{c}")
-        kb.adjust(4)
     else:
         for c in ["AAA", "AA+", "AA", "A+"]:
             kb.button(text=c, callback_data=f"clarity_{c}")
-        kb.adjust(4)
     kb.button(text="✏️ Другая", callback_data="clarity_custom")
+    kb.button(text="◀️ Назад", callback_data="buy_back")
+    kb.adjust(4, 1, 1)
     await state.set_state(BuyStone.clarity)
-    await callback.message.edit_text("🔍 *Чистота?*",
-                                     reply_markup=kb.as_markup(), parse_mode="Markdown")
-
-async def buy_step6_clarity_msg(message: Message, state: FSMContext):
-    data = await state.get_data()
-    stone_type = data.get("stone_type")
-    kb = InlineKeyboardBuilder()
-    if stone_type == "diamond":
-        for c in ["IF", "VVS1", "VVS2", "VS1", "VS2", "SI1", "SI2", "I1"]:
-            kb.button(text=c, callback_data=f"clarity_{c}")
-        kb.adjust(4)
+    text = "🔍 *Чистота?*"
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
     else:
-        for c in ["AAA", "AA+", "AA", "A+"]:
-            kb.button(text=c, callback_data=f"clarity_{c}")
-        kb.adjust(4)
-    kb.button(text="✏️ Другая", callback_data="clarity_custom")
-    await state.set_state(BuyStone.clarity)
-    await message.answer("🔍 *Чистота?*", reply_markup=kb.as_markup(), parse_mode="Markdown")
+        await target.answer(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 
 @dp.callback_query(BuyStone.clarity, F.data == "clarity_custom")
 async def buy_step6_clarity_custom(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("✏️ Введи чистоту:")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="◀️ Назад", callback_data="buy_back_clarity")
+    await callback.message.edit_text("✏️ Введи чистоту:", reply_markup=kb.as_markup())
 
 
 @dp.callback_query(BuyStone.clarity, F.data.startswith("clarity_"))
 async def buy_step6_clarity_selected(callback: CallbackQuery, state: FSMContext):
     clarity = callback.data.replace("clarity_", "")
     await state.update_data(clarity=clarity)
-    await buy_step7_price_cb(callback, state)
+    await _nav_push(state, "clarity")
+    await _show_price_prompt(callback, state)
 
 
 @dp.message(BuyStone.clarity)
 async def buy_step6_clarity_text(message: Message, state: FSMContext):
     await state.update_data(clarity=message.text.strip())
-    await buy_step7_price_msg(message, state)
+    await _nav_push(state, "clarity")
+    await _show_price_prompt(message, state)
 
 
 # ============================================================
 # КУПИЛИ — шаг 7: цена
 # ============================================================
 
-async def buy_step7_price_cb(callback: CallbackQuery, state: FSMContext):
+async def _show_price_prompt(target, state: FSMContext):
     data = await state.get_data()
     is_natural = data.get("origin") == "Природный"
     prompt = ("💵 *Цена за карат?*\n\nВведи сумму (например: 800):" if is_natural
               else "💵 *Цена за камень?*\n\nВведи сумму (например: 5000):")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="◀️ Назад", callback_data="buy_back")
     await state.set_state(BuyStone.price)
-    await callback.message.edit_text(prompt, parse_mode="Markdown")
-
-async def buy_step7_price_msg(message: Message, state: FSMContext):
-    data = await state.get_data()
-    is_natural = data.get("origin") == "Природный"
-    prompt = ("💵 *Цена за карат?*\n\nВведи сумму (например: 800):" if is_natural
-              else "💵 *Цена за камень?*\n\nВведи сумму (например: 5000):")
-    await state.set_state(BuyStone.price)
-    await message.answer(prompt, parse_mode="Markdown")
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(prompt, reply_markup=kb.as_markup(), parse_mode="Markdown")
+    else:
+        await target.answer(prompt, reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 
 @dp.message(BuyStone.price)
@@ -1501,12 +1519,8 @@ async def buy_step7_price_entered(message: Message, state: FSMContext):
             await state.update_data(price_per_carat=val)
         else:
             await state.update_data(price=val)
-        kb = InlineKeyboardBuilder()
-        for cur in ["CNY", "USD", "THB", "RUB"]:
-            kb.button(text=cur, callback_data=f"currency_{cur}")
-        kb.adjust(4)
-        await state.set_state(BuyStone.currency)
-        await message.answer("💱 *Валюта?*", reply_markup=kb.as_markup(), parse_mode="Markdown")
+        await _nav_push(state, "price")
+        await _show_currency(message, state)
     except:
         await message.answer("❌ Введи число, например: 800")
 
@@ -1514,6 +1528,20 @@ async def buy_step7_price_entered(message: Message, state: FSMContext):
 # ============================================================
 # КУПИЛИ — шаг 8: валюта → курс → поставщик
 # ============================================================
+
+async def _show_currency(target, state: FSMContext):
+    kb = InlineKeyboardBuilder()
+    for cur in ["CNY", "USD", "THB", "RUB"]:
+        kb.button(text=cur, callback_data=f"currency_{cur}")
+    kb.button(text="◀️ Назад", callback_data="buy_back")
+    kb.adjust(4, 1)
+    await state.set_state(BuyStone.currency)
+    text = "💱 *Валюта?*"
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+    else:
+        await target.answer(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+
 
 async def _show_price_summary(target, state: FSMContext):
     data = await state.get_data()
@@ -1544,7 +1572,8 @@ async def _show_price_summary(target, state: FSMContext):
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Верно", callback_data="price_ok")
     kb.button(text="✏️ Изменить", callback_data="price_edit")
-    kb.adjust(2)
+    kb.button(text="◀️ Назад", callback_data="buy_back")
+    kb.adjust(2, 1)
     await state.set_state(BuyStone.price_confirm)
     text = f"💵 *Итого:*\n\n{summary}"
     if isinstance(target, CallbackQuery):
@@ -1555,17 +1584,13 @@ async def _show_price_summary(target, state: FSMContext):
 
 @dp.callback_query(BuyStone.price_confirm, F.data == "price_ok")
 async def buy_price_confirmed(callback: CallbackQuery, state: FSMContext):
+    await _nav_push(state, "price_confirm")
     await _show_buy_supplier(callback, state)
 
 
 @dp.callback_query(BuyStone.price_confirm, F.data == "price_edit")
 async def buy_price_edit(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    is_natural = data.get("origin") == "Природный"
-    prompt = ("💵 *Цена за карат?*\n\nВведи сумму (например: 800):" if is_natural
-              else "💵 *Цена за камень?*\n\nВведи сумму (например: 5000):")
-    await state.set_state(BuyStone.price)
-    await callback.message.edit_text(prompt, parse_mode="Markdown")
+    await _show_price_prompt(callback, state)
 
 
 async def _show_buy_supplier(target, state: FSMContext):
@@ -1575,6 +1600,7 @@ async def _show_buy_supplier(target, state: FSMContext):
     for s in suppliers:
         kb.button(text=s["name"], callback_data=f"supplier_{s['id']}")
     kb.button(text="✏️ Новый поставщик", callback_data="supplier_new")
+    kb.button(text="◀️ Назад", callback_data="buy_back")
     kb.adjust(1)
     await state.set_state(BuyStone.supplier)
     if isinstance(target, CallbackQuery):
@@ -1586,14 +1612,24 @@ async def _show_buy_supplier(target, state: FSMContext):
 async def buy_step8_currency(callback: CallbackQuery, state: FSMContext):
     currency = callback.data.replace("currency_", "")
     await state.update_data(currency=currency)
+    await _nav_push(state, "currency")
     if currency == "USD":
         await state.update_data(exchange_rate=1.0)
         await _show_price_summary(callback, state)
     else:
-        await state.set_state(BuyStone.exchange_rate)
-        await callback.message.edit_text(
-            f"💱 *Курс к USD сегодня?*\n1 USD = ? {currency}\n\nВведи число (например: 7.25):",
-            parse_mode="Markdown")
+        await _show_exchange_rate(callback, state)
+
+async def _show_exchange_rate(target, state: FSMContext):
+    data = await state.get_data()
+    currency = data.get("currency", "")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="◀️ Назад", callback_data="buy_back")
+    await state.set_state(BuyStone.exchange_rate)
+    text = f"💱 *Курс к USD сегодня?*\n1 USD = ? {currency}\n\nВведи число (например: 7.25):"
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+    else:
+        await target.answer(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 @dp.message(BuyStone.exchange_rate)
 async def buy_step8_rate(message: Message, state: FSMContext):
@@ -1602,6 +1638,7 @@ async def buy_step8_rate(message: Message, state: FSMContext):
         if rate <= 0:
             raise ValueError
         await state.update_data(exchange_rate=rate)
+        await _nav_push(state, "exchange_rate")
         await _show_price_summary(message, state)
     except:
         await message.answer("❌ Введи число больше нуля, например: 7.25")
@@ -1610,7 +1647,9 @@ async def buy_step8_rate(message: Message, state: FSMContext):
 @dp.callback_query(BuyStone.supplier, F.data == "supplier_new")
 async def buy_step8_supplier_new(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BuyStone.new_supplier)
-    await callback.message.edit_text("✏️ Введи имя нового поставщика:")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="◀️ Назад", callback_data="buy_back_supplier")
+    await callback.message.edit_text("✏️ Введи имя нового поставщика:", reply_markup=kb.as_markup())
 
 
 @dp.message(BuyStone.new_supplier)
@@ -1623,7 +1662,8 @@ async def buy_step8_supplier_new_name(message: Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"❌ Ошибка сохранения: {e}")
         return
-    await _ask_photo_before_confirm(message, state)
+    await _nav_push(state, "supplier")
+    await _show_photo_step(message, state)
 
 
 @dp.callback_query(BuyStone.supplier, F.data.startswith("supplier_"))
@@ -1632,7 +1672,8 @@ async def buy_step8_supplier_selected(callback: CallbackQuery, state: FSMContext
     res = supabase.table("counterparties").select("name").eq("id", supplier_id).execute()
     supplier_name = res.data[0]["name"] if res.data else "—"
     await state.update_data(supplier_id=supplier_id, supplier_name=supplier_name)
-    await _ask_photo_before_confirm(callback, state)
+    await _nav_push(state, "supplier")
+    await _show_photo_step(callback, state)
 
 
 # ============================================================
@@ -1679,6 +1720,7 @@ async def _show_buy_confirm(target, state: FSMContext):
     )
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Внести в базу", callback_data="buy_confirm_yes")
+    kb.button(text="◀️ Назад", callback_data="buy_back")
     kb.button(text="❌ Отмена", callback_data="back_menu")
     kb.adjust(1)
     await state.set_state(BuyStone.confirm)
@@ -1712,25 +1754,37 @@ async def _ask_certificate(target):
         await target.answer(text, reply_markup=_skip_kb(), parse_mode="Markdown")
 
 
-async def _ask_photo_before_confirm(target, state: FSMContext):
-    await state.update_data(media=[], media_msg_id=None)
+async def _show_photo_step(target, state: FSMContext):
+    """Рендер шага фото — НЕ сбрасывает уже загруженное медиа (важно при "Назад")."""
     await state.set_state(BuyStone.photo)
-    text = "📸 Загрузи фото/видео камня (до 4 штук)\nМожно отправить пачкой или по одному:"
+    data = await state.get_data()
+    media = data.get("media") or []
+    n = len(media)
     kb = InlineKeyboardBuilder()
+    if n:
+        kb.button(text="✅ Готово", callback_data="media_done")
     kb.button(text="⏭ Пропустить", callback_data="skip_media")
+    kb.button(text="◀️ Назад", callback_data="buy_back")
+    kb.adjust(2 if n else 1, 1)
+    text = (f"📸 *Добавлено медиа: {n} из 4*\n\nМожно добавить ещё или нажать Готово:" if n
+            else "📸 Загрузи фото/видео камня (до 4 штук)\nМожно отправить пачкой или по одному:")
     if isinstance(target, CallbackQuery):
-        await target.message.edit_text(text, reply_markup=kb.as_markup())
+        await target.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
     else:
-        await target.answer(text, reply_markup=kb.as_markup())
+        await target.answer(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 
 async def _ask_cert_before_confirm(target, state: FSMContext):
     await state.set_state(BuyStone.certificate)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⏭ Пропустить", callback_data="skip_media")
+    kb.button(text="◀️ Назад", callback_data="buy_back")
+    kb.adjust(1)
     text = "📄 Есть сертификат? Загрузи фото или нажми Пропустить:"
     if isinstance(target, CallbackQuery):
-        await target.message.edit_text(text, reply_markup=_skip_kb())
+        await target.message.edit_text(text, reply_markup=kb.as_markup())
     else:
-        await target.answer(text, reply_markup=_skip_kb())
+        await target.answer(text, reply_markup=kb.as_markup())
 
 
 async def _finish(target, state: FSMContext):
@@ -1850,7 +1904,8 @@ async def buy_media_received(message: Message, state: FSMContext):
         kb = InlineKeyboardBuilder()
         kb.button(text="✅ Готово", callback_data="media_done")
         kb.button(text="⏭ Пропустить", callback_data="skip_media")
-        kb.adjust(2)
+        kb.button(text="◀️ Назад", callback_data="buy_back")
+        kb.adjust(2, 1)
 
         if n >= 4:
             text = "📸 *Добавлено медиа: 4 из 4* — лимит достигнут"
@@ -1883,12 +1938,14 @@ async def buy_media_received(message: Message, state: FSMContext):
                 await state.update_data(media=media, media_msg_id=sent.message_id)
 
     if n >= 4:
+        await _nav_push(state, "photo")
         await _ask_cert_before_confirm(message, state)
 
 
 @dp.callback_query(BuyStone.photo, F.data == "media_done")
 async def buy_media_done(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
+    await _nav_push(state, "photo")
     await _ask_cert_before_confirm(callback, state)
 
 
@@ -1896,6 +1953,7 @@ async def buy_media_done(callback: CallbackQuery, state: FSMContext):
 async def buy_photo_skip(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.update_data(media=[], media_msg_id=None)
+    await _nav_push(state, "photo")
     await _ask_cert_before_confirm(callback, state)
 
 
@@ -1906,13 +1964,64 @@ async def buy_photo_skip(callback: CallbackQuery, state: FSMContext):
 @dp.message(BuyStone.certificate, F.photo)
 async def buy_cert_received(message: Message, state: FSMContext):
     await state.update_data(cert_file_id=message.photo[-1].file_id)
+    await _nav_push(state, "certificate")
     await _show_buy_confirm(message, state)
 
 
 @dp.callback_query(BuyStone.certificate, F.data == "skip_media")
 async def buy_cert_skip(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
+    await _nav_push(state, "certificate")
     await _show_buy_confirm(callback, state)
+
+
+# ============================================================
+# КУПИЛИ — обработчики "◀️ Назад"
+# ============================================================
+
+# Стек-переход: возврат на предыдущий ПРОЙДЕННЫЙ шаг основного потока.
+_BUY_STEP_RENDERERS = {
+    "stone_type": _show_stone_type,
+    "origin": _show_origin,
+    "shape": _show_shape,
+    "carat": _show_carat,
+    "color": _show_color,
+    "clarity": _show_clarity,
+    "price": _show_price_prompt,
+    "currency": _show_currency,
+    "exchange_rate": _show_exchange_rate,
+    "price_confirm": _show_price_summary,
+    "supplier": _show_buy_supplier,
+    "photo": _show_photo_step,
+    "certificate": _ask_cert_before_confirm,
+}
+
+@dp.callback_query(F.data == "buy_back")
+async def buy_back(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    step = await _nav_pop(state)
+    renderer = _BUY_STEP_RENDERERS.get(step) if step else None
+    if renderer is None:
+        await _show_stone_type(callback, state)
+        return
+    await renderer(callback, state)
+
+
+# Латеральный переход: из под-подсказки (свой вариант/поиск) — назад к
+# экрану-родителю ТЕКУЩЕГО шага, без снятия стека (шаг ещё не пройден).
+_BUY_LATERAL_RENDERERS = {
+    "buy_back_type": _show_stone_type,
+    "buy_back_shape": _show_shape,
+    "buy_back_carat": _show_carat,
+    "buy_back_color": _show_color,
+    "buy_back_clarity": _show_clarity,
+    "buy_back_supplier": _show_buy_supplier,
+}
+
+@dp.callback_query(F.data.in_(_BUY_LATERAL_RENDERERS.keys()))
+async def buy_back_lateral(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await _BUY_LATERAL_RENDERERS[callback.data](callback, state)
 
 
 @dp.callback_query(BuyStone.confirm, F.data == "buy_confirm_yes")
@@ -1931,6 +2040,7 @@ async def buy_save(callback: CallbackQuery, state: FSMContext):
     if dup.data:
         kb = InlineKeyboardBuilder()
         kb.button(text="✅ Да, внести", callback_data="buy_force_yes")
+        kb.button(text="◀️ Назад", callback_data="buy_back_confirm")
         kb.button(text="❌ Отмена", callback_data="back_menu")
         kb.adjust(1)
         await state.set_state(BuyStone.duplicate_confirm)
@@ -1940,6 +2050,11 @@ async def buy_save(callback: CallbackQuery, state: FSMContext):
         return
 
     await _insert_stone(callback, state, data)
+
+
+@dp.callback_query(BuyStone.duplicate_confirm, F.data == "buy_back_confirm")
+async def buy_duplicate_back(callback: CallbackQuery, state: FSMContext):
+    await _show_buy_confirm(callback, state)
 
 
 @dp.callback_query(BuyStone.duplicate_confirm, F.data == "buy_force_yes")
