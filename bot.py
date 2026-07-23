@@ -143,10 +143,24 @@ class TransferStone(StatesGroup):
     new_partner = State()
     confirm = State()
 
+class RelocateStone(StatesGroup):
+    select_stone = State()
+    place_type   = State()
+    location     = State()
+    new_location = State()
+    holder       = State()
+    new_holder   = State()
+    confirm      = State()
+
 class ReturnStone(StatesGroup):
     select_stone  = State()
     counterparty  = State()
     reason        = State()
+    dest_type     = State()
+    dest_location = State()
+    dest_new_location = State()
+    dest_holder   = State()
+    dest_new_holder = State()
     confirm       = State()
 
 
@@ -319,6 +333,56 @@ def next_stone_code():
 
 
 # ============================================================
+# Местоположение камня — использует существующие locations/stones.location_id
+# ============================================================
+
+# locations.type для контрагента-держателя зависит от типа контрагента.
+# 'courier' в location_type нет — курьер физически "в пути", поэтому transit.
+_LOCATION_TYPE_FOR_CP_TYPE = {"partner": "partner", "client": "client", "courier": "transit"}
+
+def get_current_location_id(stone_id):
+    res = supabase.table("stones").select("location_id").eq("id", stone_id).execute()
+    return res.data[0]["location_id"] if res.data else None
+
+def get_or_create_place_for_user(user_id, user_name) -> str:
+    """locations-запись для сотрудника бота (owner/Алина): type='staff', user_id=users.id."""
+    existing = supabase.table("locations").select("id").eq("user_id", user_id).execute()
+    if existing.data:
+        return existing.data[0]["id"]
+    res = supabase.table("locations").insert({
+        "name": user_name, "type": "staff", "user_id": user_id,
+    }).execute()
+    return res.data[0]["id"]
+
+def get_or_create_place_for_counterparty(cp_id, cp_type, cp_name) -> str:
+    """locations-запись для контрагента (партнёр/клиент/курьер): counterparty_id=counterparties.id."""
+    existing = supabase.table("locations").select("id").eq("counterparty_id", cp_id).execute()
+    if existing.data:
+        return existing.data[0]["id"]
+    loc_type = _LOCATION_TYPE_FOR_CP_TYPE.get(cp_type, "other")
+    res = supabase.table("locations").insert({
+        "name": cp_name, "type": loc_type, "counterparty_id": cp_id,
+    }).execute()
+    return res.data[0]["id"]
+
+def resolve_location_display(location_id):
+    """Возвращает (префикс, имя): префикс "у " если локация = человек (counterparty_id/user_id)."""
+    if not location_id:
+        return "", "—"
+    res = supabase.table("locations").select("name,counterparty_id,user_id").eq("id", location_id).execute()
+    if not res.data:
+        return "", "—"
+    row = res.data[0]
+    prefix = "у " if (row.get("counterparty_id") or row.get("user_id")) else ""
+    return prefix, row["name"]
+
+def get_place_line(location_id) -> str:
+    """Формирует строку "📍 Где: ...". Имена людей не склоняются по падежам."""
+    prefix, name = resolve_location_display(location_id)
+    return f"📍 Где: {prefix}{name}"
+
+
+# ============================================================
 # Главное меню
 # ============================================================
 
@@ -328,11 +392,12 @@ def main_keyboard():
     kb.button(text="💰 Продали", callback_data="action_sell")
     kb.button(text="📤 Ювелиру", callback_data="action_transfer")
     kb.button(text="↩️ Возврат", callback_data="action_return")
+    kb.button(text="📍 Переместить", callback_data="action_relocate")
     kb.button(text="📋 Склад", callback_data="action_inventory")
     kb.button(text="💵 Итого", callback_data="action_total")
     kb.button(text="📊 Экспорт", callback_data="action_export")
     kb.button(text="👁 Посмотреть", callback_data="action_view")
-    kb.adjust(2, 2, 2, 2)
+    kb.adjust(2, 2, 2, 2, 1)
     return kb.as_markup()
 
 
@@ -615,16 +680,17 @@ async def cmd_addpartner(message: Message):
         return
 
     args = message.text.split(maxsplit=2)
-    valid_types = {"partner", "supplier", "client"}
+    valid_types = {"partner", "supplier", "client", "courier"}
 
     if len(args) < 3 or args[1] not in valid_types:
         await message.answer(
             "Использование: /addpartner <тип> <имя>\n\n"
-            "Типы: partner, supplier, client\n\n"
+            "Типы: partner, supplier, client, courier\n\n"
             "Примеры:\n"
             "/addpartner partner Мастер Ли\n"
             "/addpartner supplier Поставщик Чэн\n"
-            "/addpartner client Клиент Иванов")
+            "/addpartner client Клиент Иванов\n"
+            "/addpartner courier Курьер Сергей")
         return
 
     cp_type = args[1]
@@ -635,7 +701,7 @@ async def cmd_addpartner(message: Message):
         await message.answer(f"⚠️ {cp_type} с именем «{name}» уже есть в базе.")
         return
 
-    type_emoji = {"partner": "📤", "supplier": "🏪", "client": "👤"}
+    type_emoji = {"partner": "📤", "supplier": "🏪", "client": "👤", "courier": "🛵"}
     try:
         supabase.table("counterparties").insert({
             "name": name,
@@ -1691,6 +1757,10 @@ async def _insert_stone(callback: CallbackQuery, state: FSMContext, data: dict):
     stone_type = data.get("stone_type", "")
     full_type = f"{stone_type} ({origin_str})" if origin_str else stone_type
 
+    creator = supabase.table("users").select("name").eq("id", user_id).execute()
+    creator_name = creator.data[0]["name"] if creator.data else "—"
+    to_location_id = get_or_create_place_for_user(user_id, creator_name)
+
     try:
         res = supabase.table("stones").insert({
             "stone_code": stone_code,
@@ -1707,6 +1777,7 @@ async def _insert_stone(callback: CallbackQuery, state: FSMContext, data: dict):
             "supplier_id": data.get("supplier_id"),
             "status": "in_stock",
             "created_by": user_id,
+            "location_id": to_location_id,
         }).execute()
 
         stone_id = res.data[0]["id"]
@@ -1721,6 +1792,8 @@ async def _insert_stone(callback: CallbackQuery, state: FSMContext, data: dict):
             "amount_usd": price_usd,
             "exchange_rate": rate,
             "created_by": user_id,
+            "location_from": None,
+            "location_to": to_location_id,
         }).execute()
 
         for m in (data.get("media") or []):
@@ -2025,7 +2098,14 @@ async def sell_save(callback: CallbackQuery, state: FSMContext):
     amount_usd = round(data["price"] / rate, 2)
 
     try:
-        supabase.table("stones").update({"status": "sold"}).eq("id", data["stone_id"]).execute()
+        from_location_id = get_current_location_id(data["stone_id"])
+        to_location_id = get_or_create_place_for_counterparty(
+            data["client_id"], "client", data["client_name"])
+
+        supabase.table("stones").update({
+            "status": "sold",
+            "location_id": to_location_id,
+        }).eq("id", data["stone_id"]).execute()
         supabase.table("operations").insert({
             "operation_type": "sale_stone",
             "entity_type": "stone",
@@ -2036,6 +2116,8 @@ async def sell_save(callback: CallbackQuery, state: FSMContext):
             "amount_usd": amount_usd,
             "exchange_rate": rate,
             "created_by": user_id,
+            "location_from": from_location_id,
+            "location_to": to_location_id,
         }).execute()
 
         await state.clear()
@@ -2149,13 +2231,22 @@ async def transfer_save(callback: CallbackQuery, state: FSMContext):
     user_id = get_user_id(callback.from_user.id)
 
     try:
-        supabase.table("stones").update({"status": "at_partner"}).eq("id", data["stone_id"]).execute()
+        from_location_id = get_current_location_id(data["stone_id"])
+        to_location_id = get_or_create_place_for_counterparty(
+            data["partner_id"], "partner", data["partner_name"])
+
+        supabase.table("stones").update({
+            "status": "at_partner",
+            "location_id": to_location_id,
+        }).eq("id", data["stone_id"]).execute()
         supabase.table("operations").insert({
             "operation_type": "transfer_to_partner",
             "entity_type": "stone",
             "entity_id": data["stone_id"],
             "counterparty_id": data.get("partner_id"),
             "created_by": user_id,
+            "location_from": from_location_id,
+            "location_to": to_location_id,
         }).execute()
 
         await state.clear()
@@ -2163,6 +2254,230 @@ async def transfer_save(callback: CallbackQuery, state: FSMContext):
         kb.button(text="◀️ Меню", callback_data="back_menu")
         await callback.message.edit_text(
             f"✅ *Передача записана!*\n\n{data['stone_code']} → {data['partner_name']}",
+            reply_markup=kb.as_markup(), parse_mode="Markdown")
+    except Exception as e:
+        await callback.message.edit_text(f"❌ Ошибка: {e}")
+
+
+# ============================================================
+# ПЕРЕМЕСТИТЬ — смена физического местоположения камня
+# ============================================================
+
+def _place_type_kb(prefix: str, back_cb: str):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🏠 Место хранения", callback_data=f"{prefix}type_place")
+    kb.button(text="👤 У человека", callback_data=f"{prefix}type_holder")
+    kb.button(text="◀️ Назад", callback_data=back_cb)
+    kb.adjust(2, 1)
+    return kb.as_markup()
+
+
+def _location_kb(prefix: str, back_cb: str):
+    """Только "чистые" места хранения — без привязки к контрагенту/сотруднику."""
+    kb = InlineKeyboardBuilder()
+    locs = supabase.table("locations").select("id,name") \
+        .is_("counterparty_id", None).is_("user_id", None) \
+        .eq("is_active", True).order("name").execute().data or []
+    for l in locs:
+        kb.button(text=f"🏠 {l['name']}", callback_data=f"{prefix}loc_{l['id']}")
+    kb.button(text="➕ Добавить место", callback_data=f"{prefix}loc_new")
+    kb.button(text="◀️ Назад", callback_data=back_cb)
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def _holder_kb(prefix: str, back_cb: str):
+    """Сотрудники бота + контрагенты-держатели (партнёр/клиент/курьер; не supplier/lab)."""
+    kb = InlineKeyboardBuilder()
+    users = supabase.table("users").select("id,name") \
+        .eq("is_active", True).order("name").execute().data or []
+    cps = supabase.table("counterparties").select("id,name,type") \
+        .in_("type", ["partner", "client", "courier"]).order("name").execute().data or []
+    for u in users:
+        kb.button(text=f"👤 {u['name']}", callback_data=f"{prefix}hu_{u['id']}")
+    for c in cps:
+        kb.button(text=f"👤 {c['name']}", callback_data=f"{prefix}hc_{c['id']}")
+    kb.button(text="➕ Добавить человека", callback_data=f"{prefix}h_new")
+    kb.button(text="◀️ Назад", callback_data=back_cb)
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+@dp.callback_query(F.data == "action_relocate")
+async def relocate_step1(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    data = supabase.table("stones").select("id,stone_code,stone_type,carat") \
+        .not_.in_("status", ["sold", "written_off"]).order("created_at", desc=True).execute()
+
+    if not data.data:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="◀️ Меню", callback_data="back_menu")
+        await callback.message.edit_text("Нет камней для перемещения.", reply_markup=kb.as_markup())
+        return
+
+    kb = InlineKeyboardBuilder()
+    for s in data.data:
+        kb.button(text=fmt_stone_btn(s), callback_data=f"rl_stone_{s['id']}")
+    kb.button(text="◀️ Назад", callback_data="back_menu")
+    kb.adjust(1)
+    await state.set_state(RelocateStone.select_stone)
+    await callback.message.edit_text("📍 *Какой камень перемещаем?*",
+                                     reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
+async def _relocate_show_type(target, state: FSMContext):
+    data = await state.get_data()
+    await state.set_state(RelocateStone.place_type)
+    text = f"📍 *{data['stone_code']}* — куда перемещаем?"
+    kb = _place_type_kb("rl_", "action_relocate")
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+    else:
+        await target.answer(text, reply_markup=kb, parse_mode="Markdown")
+
+
+@dp.callback_query(RelocateStone.select_stone, F.data.startswith("rl_stone_"))
+async def relocate_step2_type(callback: CallbackQuery, state: FSMContext):
+    stone_id = callback.data.replace("rl_stone_", "")
+    res = supabase.table("stones").select("stone_code").eq("id", stone_id).execute()
+    stone_code = res.data[0]["stone_code"]
+    await state.update_data(stone_id=stone_id, stone_code=stone_code)
+    await _relocate_show_type(callback, state)
+
+
+@dp.callback_query(RelocateStone.place_type, F.data == "rl_type_place")
+async def relocate_step3_location(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(RelocateStone.location)
+    await callback.message.edit_text("🏠 *Выбери место хранения:*",
+                                     reply_markup=_location_kb("rl_", "rl_back_totype"),
+                                     parse_mode="Markdown")
+
+
+@dp.callback_query(RelocateStone.place_type, F.data == "rl_type_holder")
+async def relocate_step3_holder(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(RelocateStone.holder)
+    await callback.message.edit_text("👤 *У кого будет камень?*",
+                                     reply_markup=_holder_kb("rl_", "rl_back_totype"),
+                                     parse_mode="Markdown")
+
+
+@dp.callback_query(RelocateStone.location, F.data == "rl_back_totype")
+async def relocate_back_from_location(callback: CallbackQuery, state: FSMContext):
+    await _relocate_show_type(callback, state)
+
+
+@dp.callback_query(RelocateStone.holder, F.data == "rl_back_totype")
+async def relocate_back_from_holder(callback: CallbackQuery, state: FSMContext):
+    await _relocate_show_type(callback, state)
+
+
+async def _relocate_show_confirm(target, state: FSMContext):
+    data = await state.get_data()
+    prefix, place_name = resolve_location_display(data.get("new_location_id"))
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Подтвердить", callback_data="rl_confirm_yes")
+    kb.button(text="❌ Отмена", callback_data="back_menu")
+    kb.adjust(1)
+    await state.set_state(RelocateStone.confirm)
+    text = (f"📍 *Подтверди перемещение:*\n\n"
+            f"Камень: `{data['stone_code']}`\nКуда: {prefix}{place_name}")
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+    else:
+        await target.answer(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
+@dp.callback_query(RelocateStone.location, F.data == "rl_loc_new")
+async def relocate_location_new(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(RelocateStone.new_location)
+    await callback.message.edit_text("✏️ Введи название нового места хранения:")
+
+
+@dp.message(RelocateStone.new_location)
+async def relocate_location_new_name(message: Message, state: FSMContext):
+    name = message.text.strip()
+    try:
+        res = supabase.table("locations").insert({"name": name, "type": "other"}).execute()
+        await state.update_data(new_location_id=res.data[0]["id"])
+    except Exception as e:
+        await message.answer(f"❌ Ошибка сохранения: {e}")
+        return
+    await _relocate_show_confirm(message, state)
+
+
+@dp.callback_query(RelocateStone.location, F.data.startswith("rl_loc_"))
+async def relocate_location_pick(callback: CallbackQuery, state: FSMContext):
+    location_id = callback.data.replace("rl_loc_", "")
+    await state.update_data(new_location_id=location_id)
+    await _relocate_show_confirm(callback, state)
+
+
+@dp.callback_query(RelocateStone.holder, F.data == "rl_h_new")
+async def relocate_holder_new(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(RelocateStone.new_holder)
+    await callback.message.edit_text("✏️ Введи имя нового человека (например, курьера):")
+
+
+@dp.message(RelocateStone.new_holder)
+async def relocate_holder_new_name(message: Message, state: FSMContext):
+    name = message.text.strip()
+    try:
+        res = supabase.table("counterparties").insert({"name": name, "type": "courier"}).execute()
+        cp_id = res.data[0]["id"]
+        location_id = get_or_create_place_for_counterparty(cp_id, "courier", name)
+        await state.update_data(new_location_id=location_id)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка сохранения: {e}")
+        return
+    await _relocate_show_confirm(message, state)
+
+
+@dp.callback_query(RelocateStone.holder, F.data.startswith("rl_hu_"))
+async def relocate_holder_pick_user(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.data.replace("rl_hu_", "")
+    u = supabase.table("users").select("name").eq("id", user_id).execute()
+    user_name = u.data[0]["name"] if u.data else "—"
+    location_id = get_or_create_place_for_user(user_id, user_name)
+    await state.update_data(new_location_id=location_id)
+    await _relocate_show_confirm(callback, state)
+
+
+@dp.callback_query(RelocateStone.holder, F.data.startswith("rl_hc_"))
+async def relocate_holder_pick_cp(callback: CallbackQuery, state: FSMContext):
+    cp_id = callback.data.replace("rl_hc_", "")
+    c = supabase.table("counterparties").select("name,type").eq("id", cp_id).execute()
+    cp = c.data[0] if c.data else {"name": "—", "type": "partner"}
+    location_id = get_or_create_place_for_counterparty(cp_id, cp["type"], cp["name"])
+    await state.update_data(new_location_id=location_id)
+    await _relocate_show_confirm(callback, state)
+
+
+@dp.callback_query(RelocateStone.confirm, F.data == "rl_confirm_yes")
+async def relocate_save(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    user_id = get_user_id(callback.from_user.id)
+
+    try:
+        from_location_id = get_current_location_id(data["stone_id"])
+        to_location_id = data.get("new_location_id")
+
+        supabase.table("stones").update({"location_id": to_location_id}) \
+            .eq("id", data["stone_id"]).execute()
+        supabase.table("operations").insert({
+            "operation_type": "location_change",
+            "entity_type": "stone",
+            "entity_id": data["stone_id"],
+            "created_by": user_id,
+            "location_from": from_location_id,
+            "location_to": to_location_id,
+        }).execute()
+
+        prefix, place_name = resolve_location_display(to_location_id)
+        await state.clear()
+        kb = InlineKeyboardBuilder()
+        kb.button(text="◀️ Меню", callback_data="back_menu")
+        await callback.message.edit_text(
+            f"✅ *Перемещение записано!*\n\n{data['stone_code']} → {prefix}{place_name}",
             reply_markup=kb.as_markup(), parse_mode="Markdown")
     except Exception as e:
         await callback.message.edit_text(f"❌ Ошибка: {e}")
@@ -2245,8 +2560,19 @@ async def return_step3_reason(callback: CallbackQuery, state: FSMContext):
                                      reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 
+async def _return_show_desttype(target, state: FSMContext):
+    data = await state.get_data()
+    await state.set_state(ReturnStone.dest_type)
+    text = f"↩️ *Камень* `{data['stone_code']}` *возвращается.*\n\nКуда он физически едет?"
+    kb = _place_type_kb("rtd_", "action_return")
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+    else:
+        await target.answer(text, reply_markup=kb, parse_mode="Markdown")
+
+
 @dp.callback_query(ReturnStone.reason, F.data.startswith("ret_reason_"))
-async def return_step4_confirm(callback: CallbackQuery, state: FSMContext):
+async def return_step4_dest(callback: CallbackQuery, state: FSMContext):
     reason_key = callback.data.replace("ret_reason_", "")
     reason_label = next((lbl for lbl, k in _RETURN_REASONS if k == reason_key), reason_key)
     await state.update_data(reason=reason_key, reason_label=reason_label)
@@ -2255,18 +2581,118 @@ async def return_step4_confirm(callback: CallbackQuery, state: FSMContext):
     op_type = "return_from_client" if data["original_status"] == "sold" else "return_from_partner"
     await state.update_data(op_type=op_type)
 
+    await _return_show_desttype(callback, state)
+
+
+@dp.callback_query(ReturnStone.dest_type, F.data == "rtd_type_place")
+async def return_dest_location(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(ReturnStone.dest_location)
+    await callback.message.edit_text("🏠 *Выбери место хранения:*",
+                                     reply_markup=_location_kb("rtd_", "rtd_back_totype"),
+                                     parse_mode="Markdown")
+
+
+@dp.callback_query(ReturnStone.dest_type, F.data == "rtd_type_holder")
+async def return_dest_holder(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(ReturnStone.dest_holder)
+    await callback.message.edit_text("👤 *У кого будет камень?*",
+                                     reply_markup=_holder_kb("rtd_", "rtd_back_totype"),
+                                     parse_mode="Markdown")
+
+
+@dp.callback_query(ReturnStone.dest_location, F.data == "rtd_back_totype")
+async def return_back_from_location(callback: CallbackQuery, state: FSMContext):
+    await _return_show_desttype(callback, state)
+
+
+@dp.callback_query(ReturnStone.dest_holder, F.data == "rtd_back_totype")
+async def return_back_from_holder(callback: CallbackQuery, state: FSMContext):
+    await _return_show_desttype(callback, state)
+
+
+async def _return_show_confirm(target, state: FSMContext):
+    data = await state.get_data()
+    prefix, place_name = resolve_location_display(data.get("dest_location_id"))
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Подтвердить", callback_data="ret_confirm_yes")
     kb.button(text="❌ Отмена", callback_data="back_menu")
     kb.adjust(1)
     await state.set_state(ReturnStone.confirm)
-    await callback.message.edit_text(
-        f"↩️ *Подтверди возврат:*\n\n"
-        f"Камень: `{data['stone_code']}`\n"
-        f"От: {data['counterparty_name']}\n"
-        f"Причина: {reason_label}\n"
-        f"Новый статус: в наличии",
-        reply_markup=kb.as_markup(), parse_mode="Markdown")
+    text = (f"↩️ *Подтверди возврат:*\n\n"
+            f"Камень: `{data['stone_code']}`\n"
+            f"От: {data['counterparty_name']}\n"
+            f"Причина: {data['reason_label']}\n"
+            f"Новый статус: в наличии\n"
+            f"Физически едет: {prefix}{place_name}")
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+    else:
+        await target.answer(text, reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
+@dp.callback_query(ReturnStone.dest_location, F.data == "rtd_loc_new")
+async def return_dest_location_new(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(ReturnStone.dest_new_location)
+    await callback.message.edit_text("✏️ Введи название нового места хранения:")
+
+
+@dp.message(ReturnStone.dest_new_location)
+async def return_dest_location_new_name(message: Message, state: FSMContext):
+    name = message.text.strip()
+    try:
+        res = supabase.table("locations").insert({"name": name, "type": "other"}).execute()
+        await state.update_data(dest_location_id=res.data[0]["id"])
+    except Exception as e:
+        await message.answer(f"❌ Ошибка сохранения: {e}")
+        return
+    await _return_show_confirm(message, state)
+
+
+@dp.callback_query(ReturnStone.dest_location, F.data.startswith("rtd_loc_"))
+async def return_dest_location_pick(callback: CallbackQuery, state: FSMContext):
+    location_id = callback.data.replace("rtd_loc_", "")
+    await state.update_data(dest_location_id=location_id)
+    await _return_show_confirm(callback, state)
+
+
+@dp.callback_query(ReturnStone.dest_holder, F.data == "rtd_h_new")
+async def return_dest_holder_new(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(ReturnStone.dest_new_holder)
+    await callback.message.edit_text("✏️ Введи имя нового человека (например, курьера):")
+
+
+@dp.message(ReturnStone.dest_new_holder)
+async def return_dest_holder_new_name(message: Message, state: FSMContext):
+    name = message.text.strip()
+    try:
+        res = supabase.table("counterparties").insert({"name": name, "type": "courier"}).execute()
+        cp_id = res.data[0]["id"]
+        location_id = get_or_create_place_for_counterparty(cp_id, "courier", name)
+        await state.update_data(dest_location_id=location_id)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка сохранения: {e}")
+        return
+    await _return_show_confirm(message, state)
+
+
+@dp.callback_query(ReturnStone.dest_holder, F.data.startswith("rtd_hu_"))
+async def return_dest_holder_pick_user(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.data.replace("rtd_hu_", "")
+    u = supabase.table("users").select("name").eq("id", user_id).execute()
+    user_name = u.data[0]["name"] if u.data else "—"
+    location_id = get_or_create_place_for_user(user_id, user_name)
+    await state.update_data(dest_location_id=location_id)
+    await _return_show_confirm(callback, state)
+
+
+@dp.callback_query(ReturnStone.dest_holder, F.data.startswith("rtd_hc_"))
+async def return_dest_holder_pick_cp(callback: CallbackQuery, state: FSMContext):
+    cp_id = callback.data.replace("rtd_hc_", "")
+    c = supabase.table("counterparties").select("name,type").eq("id", cp_id).execute()
+    cp = c.data[0] if c.data else {"name": "—", "type": "partner"}
+    location_id = get_or_create_place_for_counterparty(cp_id, cp["type"], cp["name"])
+    await state.update_data(dest_location_id=location_id)
+    await _return_show_confirm(callback, state)
 
 
 @dp.callback_query(ReturnStone.confirm, F.data == "ret_confirm_yes")
@@ -2275,8 +2701,13 @@ async def return_save(callback: CallbackQuery, state: FSMContext):
     user_id = get_user_id(callback.from_user.id)
 
     try:
-        supabase.table("stones").update({"status": "in_stock"}) \
-            .eq("id", data["stone_id"]).execute()
+        from_location_id = get_current_location_id(data["stone_id"])
+        to_location_id = data.get("dest_location_id")
+
+        supabase.table("stones").update({
+            "status": "in_stock",
+            "location_id": to_location_id,
+        }).eq("id", data["stone_id"]).execute()
         supabase.table("operations").insert({
             "operation_type": data["op_type"],
             "entity_type":    "stone",
@@ -2284,8 +2715,11 @@ async def return_save(callback: CallbackQuery, state: FSMContext):
             "counterparty_id": data.get("counterparty_id"),
             "notes":           data.get("reason_label"),
             "created_by":      user_id,
+            "location_from": from_location_id,
+            "location_to": to_location_id,
         }).execute()
 
+        prefix, place_name = resolve_location_display(to_location_id)
         await state.clear()
         kb = InlineKeyboardBuilder()
         kb.button(text="◀️ Меню", callback_data="back_menu")
@@ -2293,7 +2727,8 @@ async def return_save(callback: CallbackQuery, state: FSMContext):
             f"✅ *Возврат записан!*\n\n"
             f"{data['stone_code']} → в наличии\n"
             f"От: {data['counterparty_name']}\n"
-            f"Причина: {data['reason_label']}",
+            f"Причина: {data['reason_label']}\n"
+            f"Физически едет: {prefix}{place_name}",
             reply_markup=kb.as_markup(), parse_mode="Markdown")
     except Exception as e:
         await callback.message.edit_text(f"❌ Ошибка: {e}")
@@ -2349,6 +2784,7 @@ async def _send_stone_card(msg: Message, s: dict):
         lines.append(f"Цвет/Чистота: {color_clarity}")
     lines += [
         f"Статус: {get_status_emoji(s['status'])} {get_status_name(s['status'])}",
+        get_place_line(s.get("location_id")),
         "",
         f"Поставщик: {supplier_name}",
         price_line,
@@ -2416,13 +2852,41 @@ async def view_filter_select(callback: CallbackQuery, state: FSMContext):
     kb.button(text="🌿 Природные",  callback_data="view_filter_natural")
     kb.button(text="⚗️ Синтетика", callback_data="view_filter_synthetic")
     kb.button(text="📋 Все",        callback_data="view_filter_all")
+    kb.button(text="📍 По месту",   callback_data="view_filter_place")
     kb.button(text="◀️ Меню",       callback_data="back_menu")
-    kb.adjust(2, 1, 1)
+    kb.adjust(2, 1, 1, 1)
     await callback.message.edit_text("👁 *Какие камни показать?*",
                                      reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 
-async def _view_show_list(callback: CallbackQuery, filter_type: str):
+@dp.callback_query(F.data == "view_filter_place")
+async def view_filter_place_menu(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    stones = supabase.table("stones").select("location_id") \
+        .not_.in_("status", ["sold", "written_off"]).execute().data or []
+
+    loc_ids = list({s["location_id"] for s in stones if s.get("location_id")})
+
+    kb = InlineKeyboardBuilder()
+    if not loc_ids:
+        kb.button(text="◀️ Назад", callback_data="action_view")
+        await callback.message.edit_text("Нет камней с проставленным местоположением.",
+                                         reply_markup=kb.as_markup())
+        return
+
+    locs = supabase.table("locations").select("id,name,counterparty_id,user_id") \
+        .in_("id", loc_ids).order("name").execute().data or []
+    for l in locs:
+        is_person = bool(l.get("counterparty_id") or l.get("user_id"))
+        icon = "👤" if is_person else "🏠"
+        kb.button(text=f"{icon} {l['name']}", callback_data=f"vf_loc_{l['id']}")
+    kb.button(text="◀️ Назад", callback_data="action_view")
+    kb.adjust(1)
+    await callback.message.edit_text("📍 *Выбери место:*",
+                                     reply_markup=kb.as_markup(), parse_mode="Markdown")
+
+
+async def _view_show_list(callback: CallbackQuery, filter_type: str, filter_value: str = None):
     q = supabase.table("stones").select("id,stone_code,stone_type,carat") \
         .not_.in_("status", ["sold", "written_off"]) \
         .order("created_at", desc=True)
@@ -2430,11 +2894,15 @@ async def _view_show_list(callback: CallbackQuery, filter_type: str):
         q = q.ilike("stone_type", "%(Природный)%")
     elif filter_type == "synthetic":
         q = q.ilike("stone_type", "%(Синтетический)%")
+    elif filter_type == "loc":
+        q = q.eq("location_id", filter_value)
     data = q.execute()
+
+    back_cb = "view_filter_place" if filter_type == "loc" else "action_view"
 
     if not data.data:
         kb = InlineKeyboardBuilder()
-        kb.button(text="◀️ Назад", callback_data="action_view")
+        kb.button(text="◀️ Назад", callback_data=back_cb)
         await callback.message.edit_text("Нет камней по этому фильтру.",
                                          reply_markup=kb.as_markup())
         return
@@ -2459,11 +2927,15 @@ async def _view_show_list(callback: CallbackQuery, filter_type: str):
         count = media_counts.get(s["id"], 0)
         badge = f"📷{count}" if count else "📷—"
         kb.button(text=f"{badge} · {fmt_stone_btn(s)}", callback_data=f"view_stone_{s['id']}")
-    kb.button(text="◀️ Назад", callback_data="action_view")
+    kb.button(text="◀️ Назад", callback_data=back_cb)
     kb.adjust(1)
 
-    titles = {"natural": "🌿 Природные", "synthetic": "⚗️ Синтетика", "all": "📋 Все"}
-    await callback.message.edit_text(f"👁 *{titles[filter_type]}* — выбери камень:",
+    if filter_type in ("natural", "synthetic", "all"):
+        title = {"natural": "🌿 Природные", "synthetic": "⚗️ Синтетика", "all": "📋 Все"}[filter_type]
+    else:
+        prefix, name = resolve_location_display(filter_value)
+        title = f"📍 {prefix}{name}"
+    await callback.message.edit_text(f"👁 *{title}* — выбери камень:",
                                      reply_markup=kb.as_markup(), parse_mode="Markdown")
 
 
@@ -2474,13 +2946,20 @@ async def view_filter_applied(callback: CallbackQuery, state: FSMContext):
     await _view_show_list(callback, filter_type)
 
 
+@dp.callback_query(F.data.startswith("vf_loc_"))
+async def view_filter_by_location(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await _view_show_list(callback, "loc", callback.data.replace("vf_loc_", ""))
+
+
 @dp.callback_query(F.data.startswith("view_stone_"))
 async def view_step2_card(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     stone_id = callback.data.replace("view_stone_", "")
     res = supabase.table("stones").select(
         "id,stone_code,stone_type,shape,carat,color,clarity,status,"
-        "purchase_price,purchase_currency,purchase_price_usd,created_at,created_by,supplier_id"
+        "purchase_price,purchase_currency,purchase_price_usd,created_at,created_by,supplier_id,"
+        "location_id"
     ).eq("id", stone_id).execute()
 
     if not res.data:
@@ -2507,7 +2986,8 @@ async def cmd_stone(message: Message, state: FSMContext):
     code = args[1].strip().upper()
     res = supabase.table("stones").select(
         "id,stone_code,stone_type,shape,carat,color,clarity,status,"
-        "purchase_price,purchase_currency,purchase_price_usd,created_at,created_by,supplier_id"
+        "purchase_price,purchase_currency,purchase_price_usd,created_at,created_by,supplier_id,"
+        "location_id"
     ).ilike("stone_code", code).execute()
 
     if not res.data:
